@@ -31,7 +31,7 @@ Developer Portal・コンソールで「App」「Create App」など、アプリ
 - Website URLが必要な場合：BOTの説明を掲載している実際のURL。例えばこのプロジェクトのGitHub URL
 
 ```text
-https://github.com/sasakinoriyuki/yousan
+https://github.com/sasakinoriyuki/kaiko_sns_bot
 ```
 
 画面の名称は変更される場合があります。現在表示される案内に従い、アプリの詳細・認証設定・キーの発行画面へ進んでください。
