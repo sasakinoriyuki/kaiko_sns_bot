@@ -5,6 +5,10 @@
  */
 const BOT_STATE_KEY = 'YOSAN_STATE_V1';
 const BOT_HANDLER = 'processLatestImageAndLog';
+const BOT_LIMITS_KEY = 'YOSAN_LIMITS_V1';
+const BOT_PREVIEW_KEY = 'YOSAN_PREVIEW_V1';
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
 
@@ -53,15 +57,18 @@ function runBot_(forcePreview) {
       base64: Utilities.base64Encode(bytes), mimeType: mimeType
     };
 
+    const properties = PropertiesService.getScriptProperties();
+    const preview = readJsonProperty_(properties, BOT_PREVIEW_KEY);
+    const previewFeeling = preview && preview.key === image.key && preview.model === config.geminiModel ? preview.feeling : null;
     if (forcePreview || config.dryRun) {
-      const feeling = analyzeImageWithGemini(image.base64, image.mimeType, config);
+      const feeling = previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
+      properties.setProperty(BOT_PREVIEW_KEY, JSON.stringify({ key: image.key, model: config.geminiModel, feeling: feeling }));
       const live = findActiveLive_(config);
       console.log('プレビュー（投稿・履歴保存なし）: ' + feeling);
       console.log(live && live.liveChatId ? '配信中のチャットを検出しました。' : '投稿可能なライブチャットはありません。');
       return { status: 'preview', feeling: feeling, videoId: live ? live.videoId : null };
     }
 
-    const properties = PropertiesService.getScriptProperties();
     let state = readJsonProperty_(properties, BOT_STATE_KEY);
     if (!state || state.key !== image.key) {
       state = { key: image.key, feeling: null, logged: false, youtube: 'pending', x: 'pending' };
@@ -72,7 +79,7 @@ function runBot_(forcePreview) {
       if (state[platform] === 'sending') state[platform] = 'unknown';
     });
     if (!state.feeling) {
-      state.feeling = analyzeImageWithGemini(image.base64, image.mimeType, config);
+      state.feeling = previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
     }
     saveState_(properties, state);
     if (!state.logged) {
@@ -85,7 +92,7 @@ function runBot_(forcePreview) {
         const live = findActiveLive_(config);
         if (live && live.liveChatId) {
           sendWithState_(properties, state, 'youtube', function () {
-            return postLatestCommentToYouTube(state.feeling, live.liveChatId);
+            return postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
           });
         } else {
           console.log('ライブ未開始、終了、またはチャット無効のためYouTube投稿を待機します。');
@@ -97,6 +104,7 @@ function runBot_(forcePreview) {
     }
     if (config.enableX && state.x === 'pending') {
       try {
+        reserveXAttempt_(config, buildXText_(state.feeling, config));
         // 画像のアップロードは投稿ではないので、失敗時は次回に再試行できる。
         const service = getTwitterService(config);
         const mediaId = uploadXImage_(service, image.base64);
@@ -109,6 +117,12 @@ function runBot_(forcePreview) {
     }
     console.log('処理結果: YouTube=' + state.youtube + ', X=' + (config.enableX ? state.x : 'disabled'));
     return { status: 'processed', youtube: state.youtube, x: config.enableX ? state.x : 'disabled' };
+  } catch (error) {
+    if (error.botWait) {
+      console.log(error.message);
+      return { status: 'rate_limited', reason: error.message };
+    }
+    throw error;
   } finally {
     lock.releaseLock();
   }
@@ -118,7 +132,7 @@ function getConfig_() {
   const values = PropertiesService.getScriptProperties().getProperties();
   const config = {
     geminiApiKey: requiredProperty_(values, 'GEMINI_API_KEY'),
-    geminiModel: (values.GEMINI_MODEL || 'gemini-flash-latest').trim(),
+    geminiModel: (values.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim(),
     folderId: values.FOLDER_ID || '1oVuLTXQou6IVr6UkTOl6wFZAX7WMqfyO',
     spreadsheetId: values.SPREADSHEET_ID || '1VPDVJkFTzF1-71p377QwurQJVmVIVjW2vXOczi7VaGc',
     channelId: values.CHANNEL_ID || 'UCJ12W_V5k49jE0M38L32Ylg',
@@ -126,10 +140,22 @@ function getConfig_() {
     dryRun: booleanProperty_(values, 'DRY_RUN', true),
     enableX: booleanProperty_(values, 'ENABLE_X', false),
     maxImageAgeMinutes: positiveNumberProperty_(values, 'MAX_IMAGE_AGE_MINUTES', 20),
-    searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60)
+    searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60),
+    geminiDailyBudget: integerBudgetProperty_(values, 'GEMINI_DAILY_REQUEST_BUDGET', 16),
+    youtubeDailyBudget: integerBudgetProperty_(values, 'YOUTUBE_DAILY_UNIT_BUDGET', 8000),
+    youtubeMinMinutes: positiveNumberProperty_(values, 'YOUTUBE_MIN_INTERVAL_MINUTES', 10),
+    xMinMinutes: positiveNumberProperty_(values, 'X_MIN_INTERVAL_MINUTES', 30),
+    xDailyBudget: integerBudgetProperty_(values, 'X_DAILY_POST_BUDGET', 1),
+    xMonthlyBudget: integerBudgetProperty_(values, 'X_31DAY_POST_BUDGET', 40)
   };
   if (!/^[a-zA-Z0-9._-]+$/.test(config.geminiModel)) {
     throw new Error('GEMINI_MODELにはモデル名だけを指定してください。');
+  }
+  if (/latest|preview/i.test(config.geminiModel)) {
+    throw new Error('モデルの自動変更を避けるためGEMINI_MODELは固定IDにしてください。推奨: ' + DEFAULT_GEMINI_MODEL);
+  }
+  if (config.youtubeMinMinutes < 10 || config.xMinMinutes < 30) {
+    throw new Error('YouTubeは10分以上、Xは30分以上の間隔を指定してください。');
   }
   if (config.searchIntervalMinutes < 60) {
     throw new Error('LIVE_SEARCH_INTERVAL_MINUTESは60以上にしてください（検索クォータ保護）。');
@@ -161,6 +187,202 @@ function positiveNumberProperty_(values, name, fallback) {
   const value = values[name] === undefined || values[name] === '' ? fallback : Number(values[name]);
   if (!Number.isFinite(value) || value <= 0) throw new Error(name + ' は正の数を指定してください。');
   return value;
+}
+
+function integerBudgetProperty_(values, name, fallback) {
+  const number = positiveNumberProperty_(values, name, fallback);
+  if (!Number.isSafeInteger(number)) throw new Error(name + ' は正の整数を指定してください。');
+  return number;
+}
+
+/** GAS内の試行予算。プロジェクト全体・別のAPIキーの使用量は取得できない。 */
+function getLimitState_() {
+  const properties = PropertiesService.getScriptProperties();
+  const state = properties.getProperty(BOT_LIMITS_KEY) === null ? {} : readJsonProperty_(properties, BOT_LIMITS_KEY);
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    throw new Error('BOTの制限状態が壊れています。' + BOT_LIMITS_KEY + ' を確認してください。');
+  }
+  ['gemini', 'youtube', 'x'].forEach(function (name) {
+    if (!Object.prototype.hasOwnProperty.call(state, name)) state[name] = {};
+    if (!state[name] || typeof state[name] !== 'object' || Array.isArray(state[name])) {
+      throw new Error('BOTの制限状態が壊れています。' + BOT_LIMITS_KEY + ' を確認してください。');
+    }
+    ['count', 'lastAttempt', 'lastPost', 'cooldownUntil'].forEach(function (key) {
+      const value = state[name][key];
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new Error('BOTの制限状態に不正な数値があります。' + BOT_LIMITS_KEY + ' を確認してください。');
+      }
+    });
+  });
+  if (state.x.days !== undefined) {
+    if (!state.x.days || typeof state.x.days !== 'object' || Array.isArray(state.x.days)) throw new Error('Xの制限状態が壊れています。');
+    Object.keys(state.x.days).forEach(function (day) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isSafeInteger(state.x.days[day]) || state.x.days[day] < 0) {
+        throw new Error('Xの制限状態に不正な日次集計があります。');
+      }
+    });
+  }
+  return state;
+}
+
+function saveLimitState_(state) {
+  PropertiesService.getScriptProperties().setProperty(BOT_LIMITS_KEY, JSON.stringify(state));
+}
+
+function waitError_(message) {
+  const error = new Error(message);
+  error.botWait = true;
+  return error;
+}
+
+function quotaDay_() {
+  return Utilities.formatDate(new Date(), QUOTA_TIME_ZONE, 'yyyy-MM-dd');
+}
+
+function checkCooldown_(row, label) {
+  if ((row.cooldownUntil || 0) > Date.now()) throw waitError_(label + 'のAPI制限が回復するまで待機します。');
+}
+
+function resetDailyCounter_(row) {
+  const day = quotaDay_();
+  if (row.day !== day) { row.day = day; row.count = 0; }
+}
+
+function reserveGeminiAttempt_(config) {
+  const state = getLimitState_();
+  const row = state.gemini;
+  checkCooldown_(row, 'Gemini');
+  resetDailyCounter_(row);
+  if ((row.count || 0) >= config.geminiDailyBudget) throw waitError_('GeminiのBOT用1日予算に達したため待機します。');
+  // 16回/日なら90分。10分トリガーが重なっても、手動実行でも短縮しない。
+  const interval = Math.max(10, 1440 / config.geminiDailyBudget) * 60000;
+  if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
+    throw waitError_('Geminiの解析間隔を空けるため待機します。');
+  }
+  row.count = (row.count || 0) + 1;
+  row.lastAttempt = Date.now();
+  saveLimitState_(state); // 保存失敗時はAPIを呼ばない。
+}
+
+function reserveYouTubeUnits_(config, units, isPost) {
+  const state = getLimitState_();
+  const row = state.youtube;
+  checkCooldown_(row, 'YouTube');
+  resetDailyCounter_(row);
+  if ((row.count || 0) + units > config.youtubeDailyBudget) {
+    throw waitError_('YouTubeのBOT用1日クォータ予算に達したため待機します。');
+  }
+  if (isPost && row.lastPost && Date.now() - row.lastPost < config.youtubeMinMinutes * 60000) {
+    throw waitError_('YouTubeへの投稿は最短' + config.youtubeMinMinutes + '分間隔です。');
+  }
+  row.count = (row.count || 0) + units;
+  if (isPost) row.lastPost = Date.now();
+  saveLimitState_(state);
+}
+
+function youtubeCall_(config, units, call) {
+  reserveYouTubeUnits_(config, units, false);
+  try { return call(); } catch (error) { noteYouTubeFailure_(error); throw error; }
+}
+
+function noteYouTubeFailure_(error) {
+  if (/quotaExceeded|rateLimitExceeded/i.test(String(error && error.message || ''))) {
+    setCooldown_('youtube', nextQuotaReset_() + 60000);
+  }
+}
+
+function reserveXAttempt_(config, text) {
+  const state = getLimitState_();
+  const row = state.x;
+  checkCooldown_(row, 'X');
+  if (row.lastText === text) throw waitError_('Xでは前回と同じ文章の連続投稿を見送ります。');
+  const interval = Math.max(config.xMinMinutes, 1440 / config.xDailyBudget) * 60000;
+  if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
+    throw waitError_('Xの投稿間隔・1日予算を守るため待機します。');
+  }
+  const day = Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd');
+  const oldest = Utilities.formatDate(new Date(Date.now() - 31 * 86400000), 'UTC', 'yyyy-MM-dd');
+  const days = row.days || {};
+  Object.keys(days).forEach(function (key) { if (key < oldest) delete days[key]; });
+  if ((days[day] || 0) >= config.xDailyBudget) throw waitError_('XのBOT用1日予算に達したため待機します。');
+  const total = Object.keys(days).reduce(function (sum, key) { return sum + days[key]; }, 0);
+  if (total >= config.xMonthlyBudget) throw waitError_('Xの直近31日分のBOT用予算に達したため待機します。');
+  days[day] = (days[day] || 0) + 1;
+  row.days = days;
+  row.lastAttempt = Date.now();
+  saveLimitState_(state); // アップロード失敗・投稿失敗も1回の試行として数える。
+}
+
+function setCooldown_(platform, until) {
+  const state = getLimitState_();
+  state[platform].cooldownUntil = Math.max(state[platform].cooldownUntil || 0, until);
+  saveLimitState_(state);
+}
+
+/** Pacificの次の午前0時を探す。夏時間の23/25時間の日も扱う。 */
+function nextQuotaReset_() {
+  const day = quotaDay_();
+  let low = Date.now();
+  let high = low + 27 * 3600000;
+  while (high - low > 1000) {
+    const middle = Math.floor((low + high) / 2);
+    if (Utilities.formatDate(new Date(middle), QUOTA_TIME_ZONE, 'yyyy-MM-dd') === day) low = middle;
+    else high = middle;
+  }
+  return high;
+}
+
+/** Retry-AfterとXのreset時刻があれば、短くしない方向で反映する。 */
+function responseResetAt_(response, fallback) {
+  const headers = typeof response.getAllHeaders === 'function' ? response.getAllHeaders() : {};
+  let until = fallback;
+  Object.keys(headers).forEach(function (name) {
+    const value = String(headers[name]);
+    if (name.toLowerCase() === 'retry-after') {
+      const parsed = /^\d+$/.test(value) ? Date.now() + Number(value) * 1000 : Date.parse(value);
+      if (Number.isFinite(parsed)) until = Math.max(until, parsed);
+    }
+    if (name.toLowerCase() === 'x-rate-limit-reset' && /^\d+$/.test(value)) {
+      until = Math.max(until, Number(value) * 1000 + 60000);
+    }
+  });
+  return until;
+}
+
+function noteXResponse_(response) {
+  if (response.getResponseCode() === 429) {
+    setCooldown_('x', responseResetAt_(response, Date.now() + 24 * 3600000));
+    return;
+  }
+  const headers = typeof response.getAllHeaders === 'function' ? response.getAllHeaders() : {};
+  const remainingName = Object.keys(headers).find(function (name) { return name.toLowerCase() === 'x-rate-limit-remaining'; });
+  if (remainingName && Number(headers[remainingName]) <= 1) {
+    setCooldown_('x', responseResetAt_(response, Date.now() + 30 * 60000));
+  }
+}
+
+function rememberXText_(text) {
+  const state = getLimitState_();
+  state.x.lastText = text;
+  saveLimitState_(state);
+}
+
+/** 秘密鍵を表示せず、BOT内部で予約した試行量だけを表示する。 */
+function showBotUsage() {
+  const config = getConfig_();
+  const report = {
+    model: config.geminiModel,
+    geminiDailyBudget: config.geminiDailyBudget,
+    geminiMinMinutes: Math.max(10, 1440 / config.geminiDailyBudget),
+    youtubeMinMinutes: config.youtubeMinMinutes,
+    youtubeDailyUnitBudget: config.youtubeDailyBudget,
+    xEnabled: config.enableX,
+    xMinMinutes: Math.max(config.xMinMinutes, 1440 / config.xDailyBudget),
+    xDailyBudget: config.xDailyBudget, x31DayBudget: config.xMonthlyBudget,
+    attempts: getLimitState_()
+  };
+  console.log(JSON.stringify(report));
+  return report;
 }
 
 function findLatestImage_(folderId) {
@@ -197,29 +419,42 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
       { text: 'この画像から、今の蚕たちの気持ちを一言お願いします。' },
       { inlineData: { mimeType: mimeType, data: base64Data } }
     ] }],
-    generationConfig: { temperature: 0.7, maxOutputTokens: 2048 }
+    // 画像1枚・短文用。モデルを固定し、不要な思考と出力トークンを抑える。
+    generationConfig: {
+      temperature: 1, maxOutputTokens: 256,
+      thinkingConfig: { thinkingBudget: 0 },
+      mediaResolution: 'MEDIA_RESOLUTION_MEDIUM'
+    }
   };
+  reserveGeminiAttempt_(config); // プレビュー・失敗・手動実行も回数に含める。
   let response;
-  // 推論の429/5xxだけを短く再試行する。投稿APIは自動再送しない。
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      response = UrlFetchApp.fetch(url, {
-        method: 'post', contentType: 'application/json',
-        headers: { 'x-goog-api-key': config.geminiApiKey },
-        payload: JSON.stringify(payload), muteHttpExceptions: true
-      });
-    } catch (error) {
-      throw new Error('Geminiへの接続に失敗しました。');
-    }
-    const code = response.getResponseCode();
-    if (attempt < 2 && (code === 429 || code >= 500)) {
-      Utilities.sleep((attempt + 1) * 1000);
-      continue;
-    }
-    if (code !== 200) throw new Error('Gemini API HTTP ' + code + '（モデル名・キー・割当を確認）。');
-    break;
+  try {
+    response = UrlFetchApp.fetch(url, {
+      method: 'post', contentType: 'application/json',
+      headers: { 'x-goog-api-key': config.geminiApiKey },
+      payload: JSON.stringify(payload), muteHttpExceptions: true
+    });
+  } catch (error) {
+    setCooldown_('gemini', Date.now() + 30 * 60000);
+    throw new Error('Geminiへの接続に失敗しました。');
   }
+  const code = response.getResponseCode();
+  if (code === 429) {
+    setCooldown_('gemini', Math.max(nextQuotaReset_(), responseResetAt_(response, Date.now() + 60000)) + 60000);
+    throw waitError_('Gemini API HTTP 429。次の割当日まで自動実行を待機します。');
+  }
+  if (code >= 500) setCooldown_('gemini', responseResetAt_(response, Date.now() + 30 * 60000));
+  if (code !== 200) throw new Error('Gemini API HTTP ' + code + '（モデル名・キー・割当を確認）。');
   const data = parseApiJson_(response, 'Gemini');
+  if (data.usageMetadata) {
+    const limits = getLimitState_();
+    limits.gemini.lastUsage = {};
+    ['promptTokenCount', 'candidatesTokenCount', 'thoughtsTokenCount'].forEach(function (name) {
+      const value = data.usageMetadata[name];
+      if (Number.isSafeInteger(value) && value >= 0) limits.gemini.lastUsage[name] = value;
+    });
+    saveLimitState_(limits);
+  }
   const candidate = data.candidates && data.candidates[0];
   if ((data.promptFeedback && data.promptFeedback.blockReason) || !candidate ||
       (candidate.finishReason && candidate.finishReason !== 'STOP')) {
@@ -268,13 +503,17 @@ function findActiveLive_(config) {
   const properties = PropertiesService.getScriptProperties();
   const videoKey = 'YOSAN_LIVE_VIDEO_' + config.channelId;
   // 配信所有者として実行している場合、検索より軽いliveBroadcasts.listを使う。
-  const channels = YouTube.Channels.list('id', { mine: true, maxResults: 50 });
+  const channels = youtubeCall_(config, 1, function () {
+    return YouTube.Channels.list('id', { mine: true, maxResults: 50 });
+  });
   let ids;
   let cachedLive = null;
   if ((channels.items || []).some(function (channel) { return channel.id === config.channelId; })) {
     // 複数同時配信にも対応するため、所有者では毎回最新の一覧を確認する。
-    const broadcasts = YouTube.LiveBroadcasts.list('snippet', {
-      broadcastStatus: 'active', broadcastType: 'all', maxResults: 50
+    const broadcasts = youtubeCall_(config, 1, function () {
+      return YouTube.LiveBroadcasts.list('snippet', {
+        broadcastStatus: 'active', broadcastType: 'all', maxResults: 50
+      });
     });
     ids = (broadcasts.items || []).filter(function (item) {
       return item.snippet && item.snippet.channelId === config.channelId;
@@ -282,7 +521,7 @@ function findActiveLive_(config) {
   } else {
     const cachedId = properties.getProperty(videoKey);
     if (cachedId) {
-      cachedLive = getLiveDetails_([cachedId], config.channelId);
+      cachedLive = getLiveDetails_([cachedId], config.channelId, config);
       if (!cachedLive) properties.deleteProperty(videoKey);
     }
     const searchKey = 'YOSAN_LAST_SEARCH_' + config.channelId;
@@ -290,20 +529,24 @@ function findActiveLive_(config) {
     if (Date.now() - lastSearch < config.searchIntervalMinutes * 60000) return cachedLive;
     // 失敗した検索もクォータを消費し得るので、実行前に時刻を保存する。
     properties.setProperty(searchKey, String(Date.now()));
-    const search = YouTube.Search.list('id', {
-      channelId: config.channelId, eventType: 'live', type: 'video', maxResults: 5
+    const search = youtubeCall_(config, 100, function () {
+      return YouTube.Search.list('id', {
+        channelId: config.channelId, eventType: 'live', type: 'video', maxResults: 5
+      });
     });
     ids = (search.items || []).filter(function (item) { return item.id && item.id.videoId; })
       .map(function (item) { return item.id.videoId; });
   }
-  const active = (ids.length ? getLiveDetails_(ids, config.channelId) : null) || cachedLive;
+  const active = (ids.length ? getLiveDetails_(ids, config.channelId, config) : null) || cachedLive;
   if (active) properties.setProperty(videoKey, active.videoId);
   else properties.deleteProperty(videoKey);
   return active;
 }
 
-function getLiveDetails_(ids, channelId) {
-  const response = YouTube.Videos.list('snippet,liveStreamingDetails', { id: ids.join(',') });
+function getLiveDetails_(ids, channelId, config) {
+  const response = youtubeCall_(config, 1, function () {
+    return YouTube.Videos.list('snippet,liveStreamingDetails', { id: ids.join(',') });
+  });
   const active = (response.items || []).filter(function (item) {
     const details = item.liveStreamingDetails;
     return item.snippet && item.snippet.channelId === channelId && details &&
@@ -315,13 +558,20 @@ function getLiveDetails_(ids, channelId) {
   return { videoId: active[0].id, liveChatId: active[0].liveStreamingDetails.activeLiveChatId || null };
 }
 
-function postLatestCommentToYouTube(feelingText, liveChatId) {
-  const result = YouTube.LiveChatMessages.insert({
-    snippet: {
-      liveChatId: liveChatId, type: 'textMessageEvent',
-      textMessageDetails: { messageText: '【今の蚕の気持ち💭】\n' + feelingText }
-    }
-  }, 'snippet');
+function postLatestCommentToYouTube(feelingText, liveChatId, config) {
+  reserveYouTubeUnits_(config, 50, true);
+  let result;
+  try {
+    result = YouTube.LiveChatMessages.insert({
+      snippet: {
+        liveChatId: liveChatId, type: 'textMessageEvent',
+        textMessageDetails: { messageText: '【今の蚕の気持ち💭】\n' + feelingText }
+      }
+    }, 'snippet');
+  } catch (error) {
+    noteYouTubeFailure_(error);
+    throw error;
+  }
   if (!result || !result.id) throw new Error('YouTube投稿の成功応答が確認できません。');
   return result.id;
 }
@@ -343,6 +593,7 @@ function uploadXImage_(service, base64Data) {
     method: 'post', contentType: 'application/x-www-form-urlencoded',
     payload: { media_data: base64Data }, muteHttpExceptions: true
   });
+  noteXResponse_(response);
   const code = response.getResponseCode();
   if (code < 200 || code >= 300) throw new Error('X画像アップロード HTTP ' + code + '（権限・APIプランを確認）。');
   const data = parseApiJson_(response, 'X画像アップロード');
@@ -352,21 +603,34 @@ function uploadXImage_(service, base64Data) {
   return data.media_id_string;
 }
 
-function postToXWithImage(feelingText, mediaId, service, config) {
-  const text = '【今の蚕の気持ち💭】\n' + shortenText_(feelingText, MAX_FEELING_CHARS) +
+function buildXText_(feelingText, config) {
+  return '【今の蚕の気持ち💭】\n' + shortenText_(feelingText, MAX_FEELING_CHARS) +
     '\n\n#蚕 #養蚕 #蚕CHANNEL\n蚕CHANNELの配信はこちら\nhttps://www.youtube.com/channel/' + config.channelId + '/live';
-  const response = service.fetch('https://api.twitter.com/2/tweets', {
-    method: 'post', contentType: 'application/json',
-    payload: JSON.stringify({ text: text, media: { media_ids: [mediaId] } }),
-    muteHttpExceptions: true
-  });
+}
+
+function postToXWithImage(feelingText, mediaId, service, config) {
+  const text = buildXText_(feelingText, config);
+  let response;
+  try {
+    response = service.fetch('https://api.twitter.com/2/tweets', {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ text: text, media: { media_ids: [mediaId] } }),
+      muteHttpExceptions: true
+    });
+  } catch (error) {
+    rememberXText_(text); // 成功した可能性が残るため同じ文面を再送しない。
+    throw error;
+  }
+  noteXResponse_(response);
   const code = response.getResponseCode();
   if (code < 200 || code >= 300) {
     const error = new Error('X投稿 HTTP ' + code + '（権限・APIプラン・割当を確認）。');
     // 明確な4xx拒否なら未投稿。5xx/タイムアウトは成功した可能性が残る。
     error.definitelyRejected = code >= 400 && code < 500 && code !== 408;
+    if (!error.definitelyRejected) rememberXText_(text);
     throw error;
   }
+  rememberXText_(text);
   const data = parseApiJson_(response, 'X投稿');
   if (!data.data || !data.data.id) throw new Error('X投稿の成功応答が確認できません。');
   return data.data.id;
@@ -389,7 +653,7 @@ function sendWithState_(properties, state, platform, send) {
     saveState_(properties, state);
     console.log(platform + 'への投稿成功。');
   } catch (error) {
-    state[platform] = error.definitelyRejected ? 'pending' : 'unknown';
+    state[platform] = error.definitelyRejected || error.botWait ? 'pending' : 'unknown';
     saveState_(properties, state);
     throw error;
   }
@@ -420,6 +684,7 @@ function saveState_(properties, state) {
 function safeError_(error) {
   // APIの応答本文・接続例外には鍵や画像情報が含まれ得るため、そのまま記録しない。
   const message = String(error && error.message || '');
+  if (error && error.botWait) return message;
   const known = message.match(/(?:quotaExceeded|liveChatEnded|liveChatDisabled|forbidden|rateLimitExceeded)/);
   if (known) return known[0];
   const http = message.match(/^(?:X投稿|X画像アップロード|Gemini API) HTTP \d{3}\b/);

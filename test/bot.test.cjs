@@ -8,8 +8,9 @@ const { createHash } = require('node:crypto');
 const source = readFileSync(resolve(__dirname, '../コード.gs'), 'utf8');
 const PNG = [...Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')];
 const CHANNEL = 'UCJ12W_V5k49jE0M38L32Ylg';
-const response = (code, body) => ({
+const response = (code, body, headers = {}) => ({
   getResponseCode: () => code,
+  getAllHeaders: () => headers,
   getContentText: () => typeof body === 'string' ? body : JSON.stringify(body)
 });
 const geminiResponse = (text = '桑の葉をもぐもぐ、おなかいっぱい！') => response(200, {
@@ -18,12 +19,14 @@ const geminiResponse = (text = '桑の葉をもぐもぐ、おなかいっぱい
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
-  let now = Date.now();
+  let now = options.now ?? Date.now();
   const calls = { gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
-    TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret', ...options.properties };
+    TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
+    GEMINI_DAILY_REQUEST_BUDGET: '144', X_DAILY_POST_BUDGET: '48', X_31DAY_POST_BUDGET: '1600',
+    ...options.properties };
   const properties = {
     getProperties: () => ({ ...values }),
     getProperty: (name) => values[name] ?? null,
@@ -92,7 +95,7 @@ function harness(options = {}) {
     setAccessToken() { return this; },
     fetch(url, request) {
       const isUpload = url.includes('/media/upload');
-      (isUpload ? calls.uploads : calls.tweets).push({ url, request: clone(request) });
+      (isUpload ? calls.uploads : calls.tweets).push({ at: now, url, request: clone(request) });
       const queue = isUpload ? uploadQueue : tweetQueue;
       const next = queue.length ? queue.shift() : isUpload ? response(200, { media_id_string: '1234567890123456789' }) : response(201, { data: { id: 'tweet-1' } });
       if (next instanceof Error) throw next;
@@ -119,14 +122,15 @@ function harness(options = {}) {
       DigestAlgorithm: { SHA_256: 'sha256' },
       computeDigest: (algorithm, bytes) => [...createHash(algorithm).update(Buffer.from(bytes)).digest()],
       base64Encode: (bytes) => Buffer.from(bytes).toString('base64'),
-      formatDate: (date, timezone) => {
+      formatDate: (date, timezone, format) => {
+        if (format === 'yyyy-MM-dd') return new Intl.DateTimeFormat('sv-SE', { timeZone: timezone }).format(date);
         assert.equal(timezone, 'Asia/Tokyo');
         return new Date(date.getTime() + 9 * 3600000).toISOString().slice(0, 19).replace('T', ' ').replace(/-/g, '/');
       },
       sleep: (ms) => calls.sleeps.push(ms)
     },
     UrlFetchApp: { fetch: (url, request) => {
-      calls.gemini.push({ url, request: clone(request) });
+      calls.gemini.push({ at: now, url, request: clone(request) });
       const next = geminiQueue.length ? geminiQueue.shift() : geminiResponse();
       if (next instanceof Error) throw next;
       return next;
@@ -151,7 +155,7 @@ function harness(options = {}) {
         return { items: videos.filter((item) => params.id.split(',').includes(item.id)) };
       } },
       LiveChatMessages: { insert: (payload, part) => {
-        calls.chats.push({ payload: clone(payload), part });
+        calls.chats.push({ at: now, payload: clone(payload), part });
         if (options.chatFailure) throw options.chatFailure;
         return { id: 'message-1' };
       } }
@@ -170,6 +174,8 @@ function harness(options = {}) {
   return { calls, values, files, triggers, context, makeFile, liveVideo,
     setVideos: (next) => { videos = next; },
     advance: (ms) => { now += ms; },
+    now: () => now,
+    refreshImage: () => { files[0].record.updated = now - 1000; },
     run: () => context.processLatestImageAndLog(),
     preview: () => context.previewLatestImage(),
     state: () => JSON.parse(values.YOSAN_STATE_V1),
@@ -183,7 +189,7 @@ test('成功後の再実行で推論・記録・YouTube・Xを重複しない', 
   for (const name of ['gemini', 'logs', 'chats', 'uploads', 'tweets']) assert.equal(h.calls[name].length, 1, name);
   assert.equal(h.calls.gemini[0].request.headers['x-goog-api-key'], 'test-gemini-key');
   assert.ok(!h.calls.gemini[0].url.includes('test-gemini-key'));
-  assert.ok(h.calls.gemini[0].url.endsWith('/gemini-flash-latest:generateContent'));
+  assert.ok(h.calls.gemini[0].url.endsWith('/gemini-3.5-flash-lite:generateContent'));
   assert.equal(h.calls.uploads[0].request.contentType, 'application/x-www-form-urlencoded');
   assert.equal(h.calls.uploads[0].request.payload.media_data, Buffer.from(PNG).toString('base64'));
   assert.equal(JSON.parse(h.calls.tweets[0].request.payload).media.media_ids[0], '1234567890123456789');
@@ -204,7 +210,8 @@ test('最新の非画像を除外し、画像の更新日時で選ぶ', () => {
 test('同じファイルIDへの上書きも新しい画像として処理する', () => {
   const h = harness();
   h.run();
-  h.files[0].record.updated += 500;
+  h.advance(10 * 60000);
+  h.refreshImage();
   h.files[0].record.bytes = [...PNG, 1];
   h.run();
   assert.equal(h.calls.gemini.length, 2);
@@ -239,14 +246,17 @@ test('偽PNG・空画像・巨大画像は推論前に拒否する', () => {
   }
 });
 
-test('Geminiの429/5xxだけを上限付きで再試行する', () => {
-  const h = harness({ geminiResponses: [response(429, {}), response(503, {}), geminiResponse()] });
-  h.run();
-  assert.equal(h.calls.gemini.length, 3);
-  assert.deepEqual(h.calls.sleeps, [1000, 2000]);
-  const failed = harness({ geminiResponses: [response(503, {}), response(503, {}), response(503, {})] });
+test('Geminiの429では停止し、5xxも即時リトライしない', () => {
+  const h = harness({ geminiResponses: [response(429, {}), geminiResponse()] });
+  assert.equal(h.run().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.deepEqual(h.calls.sleeps, []);
+  assert.equal(h.run().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 1);
+  const failed = harness({ geminiResponses: [response(503, {})] });
   assert.throws(failed.run, /HTTP 503/);
-  assert.equal(failed.calls.gemini.length, 3);
+  assert.equal(failed.calls.gemini.length, 1);
+  assert.equal(failed.run().status, 'rate_limited');
   assert.equal(failed.calls.logs.length, 0);
 });
 
@@ -323,10 +333,13 @@ test('ファイル名とAI出力をスプレッドシートの数式として実
 });
 
 test('YouTube成功後にXが429で失敗した場合、Xだけを再試行する', () => {
-  const h = harness({ tweetResponses: [response(429, {})] });
+  const h = harness({ tweetResponses: [response(429, {})], properties: { MAX_IMAGE_AGE_MINUTES: '3000' } });
   h.run();
   assert.equal(h.state().youtube, 'sent');
   assert.equal(h.state().x, 'pending');
+  h.run();
+  assert.equal(h.calls.tweets.length, 1);
+  h.advance(24 * 3600000);
   h.run();
   assert.equal(h.calls.gemini.length, 1);
   assert.equal(h.calls.chats.length, 1);
@@ -354,10 +367,11 @@ test('X投稿の5xx・不明な成功応答・タイムアウトでは再送し�
 });
 
 test('X画像アップロード失敗なら次回再試行できる', () => {
-  const h = harness({ uploadResponses: [response(403, {})] });
+  const h = harness({ uploadResponses: [response(403, {})], properties: { MAX_IMAGE_AGE_MINUTES: '120' } });
   h.run();
   assert.equal(h.state().x, 'pending');
   assert.equal(h.calls.tweets.length, 0);
+  h.advance(30 * 60000);
   h.run();
   assert.equal(h.calls.uploads.length, 2);
   assert.equal(h.calls.chats.length, 1);
@@ -408,7 +422,8 @@ test('所有者のライブ未開始は10分後に再検出できる', () => {
 test('別アカウントでも検索結果の配信IDを再利用する', () => {
   const h = harness({ ownsChannel: false });
   h.run();
-  h.files[0].record.updated += 500;
+  h.advance(10 * 60000);
+  h.refreshImage();
   h.run();
   assert.equal(h.calls.searches.length, 1);
   assert.equal(h.calls.videos.length, 2);
@@ -423,7 +438,8 @@ test('ライブ終了時はキャッシュを破棄して新しいライブへ�
   const next = h.liveVideo({ id: 'video-2' });
   next.liveStreamingDetails.activeLiveChatId = 'chat-2';
   h.setVideos([old, next]);
-  h.files[0].record.updated += 500;
+  h.advance(10 * 60000);
+  h.refreshImage();
   h.run();
   assert.equal(h.calls.chats[1].payload.snippet.liveChatId, 'chat-2');
   assert.equal(h.values['YOSAN_LIVE_VIDEO_' + CHANNEL], 'video-2');
@@ -448,7 +464,8 @@ test('所有者では古いライブが継続中でも新しく始まった配�
   next.liveStreamingDetails.actualStartTime = new Date().toISOString();
   next.liveStreamingDetails.activeLiveChatId = 'chat-2';
   h.setVideos([previous, next]);
-  h.files[0].record.updated += 500;
+  h.advance(10 * 60000);
+  h.refreshImage();
   h.run();
   assert.equal(h.calls.chats[1].payload.snippet.liveChatId, 'chat-2');
 });
@@ -530,4 +547,183 @@ test('例外の生メッセージや接続URLをログへ流さない', () => {
   assert.equal(h.context.safeError_(new Error('API failed: quotaExceeded; secret-key')), 'quotaExceeded');
   const failure = harness({ geminiResponses: [new Error('fetch https://api?key=private-key')] });
   assert.throws(failure.run, (error) => !error.message.includes('private-key'));
+});
+
+test('初期予算で24時間の10分トリガーを動かすとGemini・YouTubeは16回まで', () => {
+  const h = harness({ now: Date.parse('2026-10-07T07:00:00Z'), properties: {
+    GEMINI_DAILY_REQUEST_BUDGET: undefined, ENABLE_X: 'false'
+  } });
+  for (let i = 0; i < 144; i++) {
+    if (i) h.advance(10 * 60000);
+    h.refreshImage();
+    h.run();
+  }
+  assert.equal(h.calls.gemini.length, 16);
+  assert.equal(h.calls.chats.length, 16);
+  assert.equal(h.calls.logs.length, 16);
+  for (let i = 1; i < h.calls.gemini.length; i++) {
+    assert.ok(h.calls.gemini[i].at - h.calls.gemini[i - 1].at >= 90 * 60000);
+  }
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.count, 16 * 53);
+});
+
+test('予算確認後の10分/30分設定を24時間動かして144解析・48X試行を超えない', () => {
+  const h = harness({ now: Date.parse('2026-10-07T07:00:00Z'),
+    geminiResponses: Array.from({ length: 144 }, (_, i) => geminiResponse('桑の葉をもぐもぐ ' + i)) });
+  for (let i = 0; i < 144; i++) {
+    if (i) h.advance(10 * 60000);
+    h.refreshImage();
+    h.run();
+  }
+  assert.equal(h.calls.gemini.length, 144);
+  assert.equal(h.calls.chats.length, 144);
+  assert.equal(h.calls.tweets.length, 48);
+  for (let i = 1; i < h.calls.tweets.length; i++) {
+    assert.ok(h.calls.tweets[i].at - h.calls.tweets[i - 1].at >= 30 * 60000);
+  }
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.count, 7632);
+});
+
+test('プレビューの結果を同一画像の本番で使い、解析を重複しない', () => {
+  const h = harness({ properties: { GEMINI_DAILY_REQUEST_BUDGET: undefined } });
+  h.preview(); h.preview(); h.run();
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.chats.length, 1);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 1);
+});
+
+test('異なる画像でも手動で解析間隔を短縮できない', () => {
+  const h = harness({ properties: { GEMINI_DAILY_REQUEST_BUDGET: undefined } });
+  h.run(); h.advance(10 * 60000); h.refreshImage();
+  assert.equal(h.run().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('Geminiの日次予算はPacific日付で停止・リセットする', () => {
+  const h = harness({ now: Date.parse('2026-10-07T07:00:00Z'), properties: {
+    GEMINI_DAILY_REQUEST_BUDGET: '16', YOSAN_LIMITS_V1: JSON.stringify({ gemini: { day: '2026-10-07', count: 16 } })
+  } });
+  assert.equal(h.run().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 0);
+  h.advance(24 * 3600000); h.refreshImage(); h.run();
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 1);
+});
+
+test('Pacificの夏時間終了日は25時間後の午前0時を待つ', () => {
+  const h = harness({ now: Date.parse('2026-11-01T07:00:00Z') });
+  const reset = h.context.nextQuotaReset_();
+  assert.ok(Math.abs(reset - Date.parse('2026-11-02T08:00:00Z')) <= 1000);
+});
+
+test('GeminiのRetry-Afterが日次リセットより長ければ短縮しない', () => {
+  const h = harness({ geminiResponses: [response(429, {}, { 'Retry-After': '172800' })] });
+  h.run();
+  assert.ok(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.cooldownUntil >= h.now() + 48 * 3600000);
+});
+
+test('YouTubeは直接の手動呼び出しでも10分未満で再投稿しない', () => {
+  const h = harness();
+  const config = h.context.getConfig_();
+  h.context.postLatestCommentToYouTube('桑の葉がおいしい', 'chat-1', config);
+  h.advance(9 * 60000);
+  assert.throws(() => h.context.postLatestCommentToYouTube('まだもぐもぐ', 'chat-1', config), (error) => error.botWait);
+  assert.equal(h.calls.chats.length, 1);
+  h.advance(60000);
+  h.context.postLatestCommentToYouTube('桑の葉がおいしい', 'chat-1', config);
+  assert.equal(h.calls.chats.length, 2);
+});
+
+test('YouTubeのクォータ予算が足りなければ未送信のpendingを維持する', () => {
+  const h = harness({ properties: { YOUTUBE_DAILY_UNIT_BUDGET: '52' } });
+  h.run();
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.state().youtube, 'pending');
+  assert.equal(h.state().x, 'sent');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.count, 3);
+});
+
+test('YouTubeのquotaExceededでは次の日までAPIを止める', () => {
+  const h = harness({ ownsChannel: false, searchFailure: new Error('quotaExceeded') });
+  h.run();
+  const searches = h.calls.searches.length;
+  h.advance(60 * 60000); h.refreshImage(); h.run();
+  assert.equal(h.calls.searches.length, searches);
+  assert.equal(h.calls.channels, 1);
+});
+
+test('Xの初期設定は有効化しても1日1回で、翌日までアップロードしない', () => {
+  const h = harness({ properties: { X_DAILY_POST_BUDGET: undefined, X_31DAY_POST_BUDGET: undefined },
+    geminiResponses: [geminiResponse('一日目の桑'), geminiResponse('二日目の桑'), geminiResponse('次の日の桑')] });
+  h.run(); h.advance(30 * 60000); h.refreshImage(); h.run();
+  assert.equal(h.calls.uploads.length, 1);
+  h.advance(24 * 3600000); h.refreshImage(); h.run();
+  assert.equal(h.calls.uploads.length, 2);
+});
+
+test('Xの31日予算に達するとAPIを呼ばず、古い日次集計だけを除去する', () => {
+  const h = harness({ now: Date.parse('2026-10-07T07:00:00Z'), properties: {
+    X_31DAY_POST_BUDGET: '40', YOSAN_LIMITS_V1: JSON.stringify({ x: { days: { '2026-10-06': 40 } } })
+  } });
+  h.run();
+  assert.equal(h.calls.uploads.length, 0);
+  assert.equal(h.calls.tweets.length, 0);
+  h.advance(32 * 86400000); h.refreshImage(); h.run();
+  assert.equal(h.calls.uploads.length, 1);
+  assert.ok(!JSON.parse(h.values.YOSAN_LIMITS_V1).x.days['2026-10-06']);
+});
+
+test('Xのレート残量・resetヘッダーに合わせて次の試行を遅らせる', () => {
+  const now = Date.parse('2026-10-07T07:00:00Z');
+  const h = harness({ now, tweetResponses: [response(201, { data: { id: 'tweet-1' } }, {
+    'x-rate-limit-remaining': '0', 'x-rate-limit-reset': String(now / 1000 + 7200)
+  })], geminiResponses: [geminiResponse('最初の桑'), geminiResponse('次の桑'), geminiResponse('次の次の桑')] });
+  h.run(); h.advance(30 * 60000); h.refreshImage(); h.run();
+  assert.equal(h.calls.uploads.length, 1);
+  h.advance(92 * 60000); h.refreshImage(); h.run();
+  assert.equal(h.calls.tweets.length, 2);
+});
+
+test('Xの同じ文面は翌日も連続投稿しない', () => {
+  const h = harness();
+  h.run(); h.advance(24 * 3600000); h.refreshImage(); h.run();
+  assert.equal(h.calls.chats.length, 2);
+  assert.equal(h.calls.tweets.length, 1);
+});
+
+test('制限状態を保存できなければGeminiを呼ばない', () => {
+  const h = harness({ failPropertyWrite: (name) => name === 'YOSAN_LIMITS_V1' });
+  assert.throws(h.run, /property storage/);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('壊れた制限状態と短すぎる間隔は停止し、予算を黙ってリセットしない', () => {
+  const cases = [ { YOSAN_LIMITS_V1: '[]' }, { YOSAN_LIMITS_V1: 'false' }, { YOSAN_LIMITS_V1: 'null' },
+    { YOSAN_LIMITS_V1: JSON.stringify({ gemini: null }) },
+    { YOSAN_LIMITS_V1: JSON.stringify({ x: { days: 0 } }) },
+    { YOSAN_LIMITS_V1: JSON.stringify({ gemini: { count: -1 } }) },
+    { YOSAN_LIMITS_V1: JSON.stringify({ x: { days: { '2026-10-07': '2' } } }) },
+    { GEMINI_DAILY_REQUEST_BUDGET: '2.5' }, { GEMINI_MODEL: 'gemini-flash-latest' },
+    { YOUTUBE_MIN_INTERVAL_MINUTES: '5' }, { X_MIN_INTERVAL_MINUTES: '10' } ];
+  for (const properties of cases) {
+    const h = harness({ properties });
+    assert.throws(h.run);
+    assert.equal(h.calls.gemini.length, 0);
+    assert.equal(h.calls.chats.length, 0);
+  }
+});
+
+test('利用状況はキーを出さず、実レスポンスのトークン数を表示する', () => {
+  const data = { candidates: [{ finishReason: 'STOP', content: { parts: [{ text: '桑の葉がおいしい' }] } }],
+    usageMetadata: { promptTokenCount: 980, candidatesTokenCount: 28, thoughtsTokenCount: 0 } };
+  const h = harness({ geminiResponses: [response(200, data)] });
+  h.run();
+  const report = h.context.showBotUsage();
+  assert.equal(report.attempts.gemini.lastUsage.promptTokenCount, 980);
+  assert.equal(report.attempts.gemini.lastUsage.thoughtsTokenCount, 0);
+  assert.ok(!JSON.stringify(report).includes('test-gemini-key'));
+  const payload = JSON.parse(h.calls.gemini[0].request.payload);
+  assert.equal(payload.generationConfig.maxOutputTokens, 256);
+  assert.equal(payload.generationConfig.thinkingConfig.thinkingBudget, 0);
 });
