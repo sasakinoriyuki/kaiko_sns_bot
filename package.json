@@ -1,0 +1,12 @@
+{
+  "name": "yousan-gas-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "蚕CHANNELの画像推論とYouTubeライブチャット連携（GAS）",
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
