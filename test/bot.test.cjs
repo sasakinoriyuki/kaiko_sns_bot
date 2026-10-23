@@ -21,7 +21,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 function harness(options = {}) {
   let now = options.now ?? Date.now();
   const calls = { gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
-    chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
+    instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
     TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
@@ -130,6 +130,21 @@ function harness(options = {}) {
       sleep: (ms) => calls.sleeps.push(ms)
     },
     UrlFetchApp: { fetch: (url, request) => {
+      if (url.startsWith('https://images.example/')) {
+        calls.publicImages.push({ url, request: clone(request) });
+        if (options.publicFailure) throw options.publicFailure;
+        return { ...response(options.publicCode || 200, ''),
+          getBlob: () => ({ getBytes: () => options.publicBytes || files[0].record.bytes }) };
+      }
+      if (url.startsWith('https://graph.instagram.com/')) {
+        calls.instagram.push({ at: now, url, request: clone(request) });
+        const kind = url.includes('/media_publish') ? 'publish' : request.method === 'get' ? 'status' : 'create';
+        const next = options.instagramReply
+          ? options.instagramReply(kind, calls.instagram.length)
+          : response(200, kind === 'status' ? { status_code: 'FINISHED' } : { id: kind === 'create' ? '1234' : '5678' });
+        if (next instanceof Error) throw next;
+        return next;
+      }
       calls.gemini.push({ at: now, url, request: clone(request) });
       const next = geminiQueue.length ? geminiQueue.shift() : geminiResponse();
       if (next instanceof Error) throw next;
@@ -726,4 +741,177 @@ test('利用状況はキーを出さず、実レスポンスのトークン数�
   const payload = JSON.parse(h.calls.gemini[0].request.payload);
   assert.equal(payload.generationConfig.maxOutputTokens, 256);
   assert.equal(payload.generationConfig.thinkingConfig.thinkingBudget, 0);
+});
+
+
+const JPEG = [255, 216, 255, 224, 0, 16, 74, 70, 73, 70];
+function instagramHarness(options = {}) {
+  return harness({
+    ...options,
+    files: options.files || [{ name: 'photo.jpg', mime: 'image/jpeg', bytes: JPEG }],
+    properties: {
+      ENABLE_X: 'false', ENABLE_INSTAGRAM: 'true',
+      INSTAGRAM_USER_ID: '17841400000000000',
+      INSTAGRAM_ACCESS_TOKEN: 'private-instagram-token',
+      INSTAGRAM_IMAGE_URL_TEMPLATE: 'https://images.example/{digest}.jpg',
+      ...options.properties
+    }
+  });
+}
+
+test('Instagramは初期状態で無効、認証情報不要、1日予算は1回', () => {
+  const h = harness();
+  assert.equal(h.context.getConfig_().enableInstagram, false);
+  assert.equal(h.context.getConfig_().instagramDailyBudget, 1);
+  assert.equal(h.run().instagram, 'disabled');
+  assert.equal(h.calls.instagram.length, 0);
+});
+
+test('Instagramは同じJPEGと解析結果で投稿し、再実行しても重複しない', () => {
+  const h = instagramHarness();
+  h.preview();
+  assert.equal(h.calls.instagram.length, 0);
+  assert.equal(h.calls.publicImages.length, 0);
+  assert.equal(h.run().instagram, 'sent');
+  h.run();
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.instagram.length, 3);
+  assert.equal(h.calls.publicImages.length, 1);
+  assert.equal(h.state().instagramId, '5678');
+  const create = h.calls.instagram[0];
+  assert.equal(create.request.payload.caption, '【今の蚕の気持ち💭】\n' + h.state().feeling);
+  assert.ok(!create.url.includes('private-instagram-token'));
+  assert.equal(create.request.headers.Authorization, 'Bearer private-instagram-token');
+  assert.ok(!JSON.stringify(h.context.showBotUsage()).includes('private-instagram-token'));
+  assert.ok(!h.calls.console.join('\n').includes('private-instagram-token'));
+});
+
+test('既存の保存状態にInstagramフィールドがなくても解析せず追加する', () => {
+  const h = instagramHarness({ properties: { ENABLE_INSTAGRAM: 'false' } });
+  h.run();
+  const state = h.state(); delete state.instagram;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  h.values.ENABLE_INSTAGRAM = 'true';
+  assert.equal(h.run().instagram, 'sent');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('Instagram初期予算は日付をまたいでも24時間未満なら投稿しない', () => {
+  const h = instagramHarness({ now: Date.parse('2026-10-07T23:30:00Z') });
+  h.run();
+  h.advance(60 * 60000); h.refreshImage(); h.run();
+  assert.equal(h.calls.instagram.filter(x => x.url.endsWith('/media')).length, 1);
+  h.advance(23 * 3600000); h.refreshImage(); h.run();
+  assert.equal(h.calls.instagram.filter(x => x.url.endsWith('/media')).length, 2);
+});
+
+test('Instagramの失敗試行も予算に含みYouTubeの成功に影響しない', () => {
+  const h = instagramHarness({ publicCode: 403 });
+  assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.state().instagram, 'pending');
+  h.run();
+  assert.equal(h.calls.publicImages.length, 1);
+  assert.equal(h.calls.instagram.length, 0);
+});
+
+test('Instagramの画像がPNG・別JPEG・非画像なら公開コンテナを作らない', () => {
+  for (const options of [
+    { files: [{ bytes: PNG }] },
+    { publicBytes: [...JPEG, 1] },
+    { publicBytes: [1, 2, 3] },
+    { publicBytes: PNG }
+  ]) {
+    const h = instagramHarness(options);
+    assert.equal(h.run().youtube, 'sent');
+    assert.equal(h.calls.instagram.length, 0);
+  }
+});
+
+test('Instagram処理中のコンテナは保存して次回に公開、予算を再消費しない', () => {
+  let finished = false;
+  const h = instagramHarness({ instagramReply: kind => response(200,
+    kind === 'status' ? { status_code: finished ? 'FINISHED' : 'IN_PROGRESS' } : { id: kind === 'create' ? '1234' : '5678' }) });
+  h.run();
+  assert.equal(h.state().instagram, 'pending');
+  assert.equal(h.state().instagramContainerId, '1234');
+  finished = true;
+  h.run();
+  assert.equal(h.state().instagram, 'sent');
+  assert.equal(h.calls.publicImages.length, 1);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).instagram.count, 1);
+});
+
+test('Instagramの公開タイムアウト・5xx・不正JSON・ID欠落では自動再送しない', () => {
+  for (const result of [new Error('timeout private-instagram-token'), response(503, {}),
+    response(200, 'invalid json'), response(200, {})]) {
+    const h = instagramHarness({ instagramReply: kind => kind === 'publish' ? result :
+      response(200, kind === 'status' ? { status_code: 'FINISHED' } : { id: '1234' }) });
+    h.run(); h.run();
+    assert.equal(h.state().instagram, 'unknown');
+    assert.equal(h.calls.instagram.filter(x => x.url.includes('media_publish')).length, 1);
+    assert.ok(!h.calls.console.join('\n').includes('private-instagram-token'));
+  }
+});
+
+test('Instagram公開の明確な4xx拒否はコンテナを保持し再試行できる', () => {
+  let rejected = true;
+  const h = instagramHarness({ properties: { MAX_IMAGE_AGE_MINUTES: '3000' }, instagramReply: kind => kind === 'publish'
+    ? rejected ? response(403, {}) : response(200, { id: '5678' })
+    : response(200, kind === 'status' ? { status_code: 'FINISHED' } : { id: '1234' }) });
+  h.run(); assert.equal(h.state().instagram, 'pending');
+  rejected = false; h.run();
+  assert.equal(h.state().instagram, 'pending');
+  h.advance(24 * 3600000); h.run();
+  assert.equal(h.state().instagram, 'sent');
+  assert.equal(h.calls.publicImages.length, 1);
+});
+
+test('Instagramの429後はコンテナの確認も待機する', () => {
+  const h = instagramHarness({ instagramReply: kind => kind === 'publish' ? response(429, {}, { 'Retry-After': '172800' }) :
+    response(200, kind === 'status' ? { status_code: 'FINISHED' } : { id: '1234' }) });
+  h.run(); h.run();
+  assert.equal(h.calls.instagram.length, 3);
+  assert.equal(h.state().instagram, 'pending');
+  assert.ok(JSON.parse(h.values.YOSAN_LIMITS_V1).instagram.cooldownUntil >= h.now() + 48 * 3600000);
+});
+
+test('InstagramコンテナのERROR・EXPIREDは停止、PUBLISHEDはunknownで再公開しない', () => {
+  for (const status of ['ERROR', 'EXPIRED', 'PUBLISHED']) {
+    const h = instagramHarness({ instagramReply: kind => response(200,
+      kind === 'status' ? { status_code: status } : { id: '1234' }) });
+    h.run(); h.run();
+    assert.equal(h.state().instagram, status === 'PUBLISHED' ? 'unknown' : 'failed');
+    assert.equal(h.calls.instagram.filter(x => x.url.includes('media_publish')).length, 0);
+  }
+});
+
+test('Instagramの送信状態・成功後の保存失敗から二重公開しない', () => {
+  let fail = true;
+  const h = instagramHarness({ failPropertyWrite: (name, value) => name === 'YOSAN_STATE_V1' &&
+    JSON.parse(value).instagram === 'sent' && fail });
+  h.run(); fail = false; h.run();
+  assert.equal(h.state().instagram, 'unknown');
+  assert.equal(h.calls.instagram.filter(x => x.url.includes('media_publish')).length, 1);
+});
+
+test('Instagramの公開直前に状態保存できなければ送信しない', () => {
+  const h = instagramHarness({ failPropertyWrite: (name, value) => name === 'YOSAN_STATE_V1' &&
+    JSON.parse(value).instagram === 'sending' });
+  h.run();
+  assert.equal(h.calls.instagram.filter(x => x.url.includes('media_publish')).length, 0);
+});
+
+test('Instagramの設定不備・制限状態破損は投稿前に停止する', () => {
+  for (const properties of [
+    { ENABLE_INSTAGRAM: 'TRUE' }, { INSTAGRAM_ACCESS_TOKEN: undefined },
+    { INSTAGRAM_USER_ID: 'username' }, { INSTAGRAM_IMAGE_URL_TEMPLATE: 'https://images.example/latest.jpg' },
+    { INSTAGRAM_IMAGE_URL_TEMPLATE: 'http://images.example/{digest}.jpg' },
+    { INSTAGRAM_API_VERSION: 'v25.0/path' }, { INSTAGRAM_DAILY_POST_BUDGET: '1.5' },
+    { YOSAN_LIMITS_V1: JSON.stringify({ instagram: { count: -1 } }) }
+  ]) {
+    const h = instagramHarness({ properties });
+    assert.throws(h.run);
+    assert.equal(h.calls.instagram.length, 0);
+  }
 });

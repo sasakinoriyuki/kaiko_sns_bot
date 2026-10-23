@@ -53,7 +53,7 @@ function runBot_(forcePreview) {
       .join('');
     const image = {
       key: file.getId() + ':' + modifiedTime + ':' + digest,
-      name: file.getName(), modifiedTime: modifiedTime,
+      name: file.getName(), modifiedTime: modifiedTime, fileId: file.getId(), digest: digest,
       base64: Utilities.base64Encode(bytes), mimeType: mimeType
     };
 
@@ -71,11 +71,12 @@ function runBot_(forcePreview) {
 
     let state = readJsonProperty_(properties, BOT_STATE_KEY);
     if (!state || state.key !== image.key) {
-      state = { key: image.key, feeling: null, logged: false, youtube: 'pending', x: 'pending' };
+      state = { key: image.key, feeling: null, logged: false, youtube: 'pending', x: 'pending', instagram: 'pending' };
     }
     // 投稿直前に保存した状態が残った場合、成功応答を受け取れたか判定できない。
     // 同じ画像を自動再送すると二重投稿になり得るので、実際の投稿を人が確認する。
-    ['youtube', 'x'].forEach(function (platform) {
+    if (state.instagram === undefined) state.instagram = 'pending';
+    ['youtube', 'x', 'instagram'].forEach(function (platform) {
       if (state[platform] === 'sending') state[platform] = 'unknown';
     });
     if (!state.feeling) {
@@ -115,8 +116,12 @@ function runBot_(forcePreview) {
         console.error('X処理失敗: ' + safeError_(error));
       }
     }
-    console.log('処理結果: YouTube=' + state.youtube + ', X=' + (config.enableX ? state.x : 'disabled'));
-    return { status: 'processed', youtube: state.youtube, x: config.enableX ? state.x : 'disabled' };
+    if (config.enableInstagram && state.instagram === 'pending') {
+      try { processInstagram_(properties, state, image, config); }
+      catch (error) { console.error('Instagram処理失敗: ' + safeError_(error)); }
+    }
+    console.log('処理結果: YouTube=' + state.youtube + ', X=' + (config.enableX ? state.x : 'disabled') + ', Instagram=' + (config.enableInstagram ? state.instagram : 'disabled'));
+    return { status: 'processed', youtube: state.youtube, x: config.enableX ? state.x : 'disabled', instagram: config.enableInstagram ? state.instagram : 'disabled' };
   } catch (error) {
     if (error.botWait) {
       console.log(error.message);
@@ -139,6 +144,8 @@ function getConfig_() {
     logSheetName: values.LOG_SHEET_NAME || '蚕ログ',
     dryRun: booleanProperty_(values, 'DRY_RUN', true),
     enableX: booleanProperty_(values, 'ENABLE_X', false),
+    enableInstagram: booleanProperty_(values, 'ENABLE_INSTAGRAM', false),
+    instagramDailyBudget: integerBudgetProperty_(values, 'INSTAGRAM_DAILY_POST_BUDGET', 1),
     maxImageAgeMinutes: positiveNumberProperty_(values, 'MAX_IMAGE_AGE_MINUTES', 20),
     searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60),
     geminiDailyBudget: integerBudgetProperty_(values, 'GEMINI_DAILY_REQUEST_BUDGET', 16),
@@ -164,6 +171,17 @@ function getConfig_() {
     ['TWITTER_API_KEY', 'TWITTER_API_SECRET', 'TWITTER_ACCESS_TOKEN', 'TWITTER_ACCESS_SECRET'].forEach(function (name) {
       config[name] = requiredProperty_(values, name);
     });
+  }
+  if (config.enableInstagram) {
+    config.instagramUserId = requiredProperty_(values, 'INSTAGRAM_USER_ID');
+    config.instagramAccessToken = requiredProperty_(values, 'INSTAGRAM_ACCESS_TOKEN');
+    config.instagramImageUrl = requiredProperty_(values, 'INSTAGRAM_IMAGE_URL_TEMPLATE');
+    config.instagramApiVersion = (values.INSTAGRAM_API_VERSION || 'v25.0').trim();
+    if (!/^\d+$/.test(config.instagramUserId)) throw new Error('INSTAGRAM_USER_IDは数値のIDを指定してください。');
+    if (!/^v\d+\.0$/.test(config.instagramApiVersion)) throw new Error('INSTAGRAM_API_VERSIONが不正です。');
+    if (!/^https:\/\//i.test(config.instagramImageUrl) || !config.instagramImageUrl.includes('{digest}')) {
+      throw new Error('INSTAGRAM_IMAGE_URL_TEMPLATEは{digest}を含む公開HTTPS URLにしてください。');
+    }
   }
   return config;
 }
@@ -202,7 +220,7 @@ function getLimitState_() {
   if (!state || typeof state !== 'object' || Array.isArray(state)) {
     throw new Error('BOTの制限状態が壊れています。' + BOT_LIMITS_KEY + ' を確認してください。');
   }
-  ['gemini', 'youtube', 'x'].forEach(function (name) {
+  ['gemini', 'youtube', 'x', 'instagram'].forEach(function (name) {
     if (!Object.prototype.hasOwnProperty.call(state, name)) state[name] = {};
     if (!state[name] || typeof state[name] !== 'object' || Array.isArray(state[name])) {
       throw new Error('BOTの制限状態が壊れています。' + BOT_LIMITS_KEY + ' を確認してください。');
@@ -376,6 +394,8 @@ function showBotUsage() {
     geminiMinMinutes: Math.max(10, 1440 / config.geminiDailyBudget),
     youtubeMinMinutes: config.youtubeMinMinutes,
     youtubeDailyUnitBudget: config.youtubeDailyBudget,
+    instagramEnabled: config.enableInstagram,
+    instagramDailyBudget: config.instagramDailyBudget,
     xEnabled: config.enableX,
     xMinMinutes: Math.max(config.xMinMinutes, 1440 / config.xDailyBudget),
     xDailyBudget: config.xDailyBudget, x31DayBudget: config.xMonthlyBudget,
@@ -687,12 +707,21 @@ function safeError_(error) {
   if (error && error.botWait) return message;
   const known = message.match(/(?:quotaExceeded|liveChatEnded|liveChatDisabled|forbidden|rateLimitExceeded)/);
   if (known) return known[0];
-  const http = message.match(/^(?:X投稿|X画像アップロード|Gemini API) HTTP \d{3}\b/);
+  const http = message.match(/^(?:X投稿|X画像アップロード|Gemini API|Instagram API) HTTP \d{3}\b/);
   if (http) return http[0];
   if (message === 'YouTube投稿の成功応答が確認できません。' ||
       message === 'OAuth1ライブラリを追加してください。' ||
       message === 'X画像アップロードのmedia_idが取得できません。' ||
       message === 'X投稿の成功応答が確認できません。') return message;
+  const instagramMessages = [
+    'Instagram用の画像はJPEGで保存してください。',
+    'Instagram用の公開画像を取得できません。',
+    'Instagram用の公開画像は5 MiB以下のJPEGにしてください。',
+    'Instagram用の公開画像と解析対象が一致しません。',
+    'InstagramのコンテナIDを取得できません。',
+    'Instagramの投稿成功応答が確認できません。'
+  ];
+  if (instagramMessages.indexOf(message) !== -1) return message;
   return 'サービス呼び出しに失敗しました。認可・サービス設定・割当を確認してください。';
 }
 
@@ -709,4 +738,90 @@ function removeBotTriggers() {
   ScriptApp.getProjectTriggers().filter(function (trigger) {
     return trigger.getHandlerFunction() === BOT_HANDLER;
   }).forEach(function (trigger) { ScriptApp.deleteTrigger(trigger); });
+}
+
+
+/** Instagram API with Instagram Login。追加のGemini呼び出しは行わない。 */
+function reserveInstagramAttempt_(config) {
+  const limits = getLimitState_();
+  const row = limits.instagram;
+  checkCooldown_(row, 'Instagram');
+  const day = Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd');
+  if (row.day !== day) { row.day = day; row.count = 0; }
+  if ((row.count || 0) >= config.instagramDailyBudget ||
+      (row.lastAttempt !== undefined && Date.now() - row.lastAttempt < 86400000 / config.instagramDailyBudget)) {
+    throw waitError_('Instagramの投稿間隔・1日予算を守るため待機します。');
+  }
+  row.count = (row.count || 0) + 1;
+  row.lastAttempt = Date.now();
+  saveLimitState_(limits);
+}
+
+function instagramCall_(config, path, method, payload) {
+  let response;
+  try {
+    response = UrlFetchApp.fetch('https://graph.instagram.com/' + config.instagramApiVersion + '/' + path, {
+      method: method, headers: { Authorization: 'Bearer ' + config.instagramAccessToken },
+      payload: payload, muteHttpExceptions: true
+    });
+  } catch (error) {
+    throw new Error('Instagram APIへの接続に失敗しました。');
+  }
+  const code = response.getResponseCode();
+  if (code < 200 || code >= 300) {
+    if (code === 429) setCooldown_('instagram', responseResetAt_(response, Date.now() + 86400000));
+    const error = new Error('Instagram API HTTP ' + code);
+    error.definitelyRejected = code >= 400 && code < 500 && code !== 408;
+    throw error;
+  }
+  return parseApiJson_(response, 'Instagram');
+}
+
+function processInstagram_(properties, state, image, config) {
+  checkCooldown_(getLimitState_().instagram, 'Instagram');
+  if (!state.instagramContainerId) {
+    if (image.mimeType !== 'image/jpeg') throw new Error('Instagram用の画像はJPEGで保存してください。');
+    reserveInstagramAttempt_(config);
+    const url = config.instagramImageUrl
+      .replace(/\{fileId\}/g, encodeURIComponent(image.fileId))
+      .replace(/\{digest\}/g, image.digest);
+    let response;
+    try { response = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true }); }
+    catch (error) { throw new Error('Instagram用の公開画像を取得できません。'); }
+    if (response.getResponseCode() !== 200) throw new Error('Instagram用の公開画像を取得できません。');
+    const bytes = response.getBlob().getBytes();
+    if (bytes.length > MAX_IMAGE_BYTES || detectImageMime_(bytes) !== 'image/jpeg') {
+      throw new Error('Instagram用の公開画像は5 MiB以下のJPEGにしてください。');
+    }
+    const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, bytes)
+      .map(function (value) { return ('0' + ((value + 256) % 256).toString(16)).slice(-2); }).join('');
+    if (digest !== image.digest) throw new Error('Instagram用の公開画像と解析対象が一致しません。');
+    const container = instagramCall_(config, config.instagramUserId + '/media', 'post', {
+      image_url: url, caption: '【今の蚕の気持ち💭】\n' + state.feeling
+    });
+    if (!container.id || !/^\d+$/.test(String(container.id))) throw new Error('InstagramのコンテナIDを取得できません。');
+    state.instagramContainerId = String(container.id);
+    saveState_(properties, state);
+  }
+  const container = instagramCall_(config, state.instagramContainerId + '?fields=status_code', 'get');
+  if (container.status_code === 'ERROR' || container.status_code === 'EXPIRED') {
+    state.instagram = 'failed';
+    saveState_(properties, state);
+    return;
+  }
+  if (container.status_code === 'PUBLISHED') {
+    state.instagram = 'unknown';
+    saveState_(properties, state);
+    return;
+  }
+  if (container.status_code !== 'FINISHED') return;
+  if (state.instagramPublishAttempted) reserveInstagramAttempt_(config);
+  state.instagramPublishAttempted = true;
+  sendWithState_(properties, state, 'instagram', function () {
+    const published = instagramCall_(config, config.instagramUserId + '/media_publish', 'post', {
+      creation_id: state.instagramContainerId
+    });
+    if (!published.id || !/^\d+$/.test(String(published.id))) throw new Error('Instagramの投稿成功応答が確認できません。');
+    return String(published.id);
+  });
 }

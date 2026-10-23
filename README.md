@@ -1,12 +1,14 @@
 # 蚕CHANNEL ライブ配信連携BOT（GAS）
 
-Google Driveの最新スクリーンショットをGeminiで読み取り、蚕の「気持ち」を想像した短文をYouTubeライブチャットへ投稿します。Xへの画像付き投稿も任意で有効にできます。画像を撮影・同期するPC側の処理は、このGASには含みません。
+Google Driveの最新スクリーンショットをGeminiで読み取り、蚕の「気持ち」を想像した短文をYouTubeライブチャットへ投稿します。X・Instagramへの画像付き投稿も任意で有効にできます。画像を撮影・同期するPC側の処理は、このGASには含みません。
 
 本体は [`コード.gs`](コード.gs)、GASのサービス・権限設定は [`appsscript.json`](appsscript.json) です。元のコードから、フォルダ・スプレッドシート・チャンネルのIDを引き継いでいます。秘密鍵はソースに書きません。
 
 初めて使う場合は、[使い方ガイド](使い方ガイド.md)を読んでください。できること、GASの画面での設定方法、動作確認、自動実行の開始・停止を順番に説明しています。
 
 [モデルと利用制限の計算](モデルと利用制限.md)、[X APIを初めて使う人向けの導入手順](X_API導入手順.md)も追加しています。共有キーの上限が不明なため、初期予算はGemini 16回/日、Xは有効化後も1試行/日です。10分トリガーで動かしても、初期設定の解析・YouTube投稿は通常90分間隔になります。これらはBOTの予算であり、外部APIの無料枠を確認した数値ではありません。
+
+Instagramのアカウント準備・認証・公開画像URL・投稿テストは[導入手順](導入手順.md)を参照してください。初期状態では無効、有効化後も1試行/日・24時間以上の間隔です。既存のGemini解析結果を再利用し、解析対象と同一のJPEGを公開HTTPS URLにも保存します。
 
 ## 元コードで直した点
 
@@ -33,7 +35,7 @@ Google Driveの最新スクリーンショットをGeminiで読み取り、蚕�
 3. 「サービス」で **YouTube Data API v3**、識別子 **YouTube** が追加されていることを確認します。標準Google Cloudプロジェクトを紐付けている場合は、そのプロジェクト側でもYouTube Data API v3を有効にします。
 4. 「プロジェクトの設定 > スクリプト プロパティ」に、下記の設定を追加します。キーをチャットやコードに貼る必要はありません。
 5. 配信者のYouTubeチャンネルを利用でき、Driveフォルダの閲覧・スプレッドシートの編集も可能なGoogleアカウントで `previewLatestImage()` を手動実行し、権限を許可します。実行ログの短文と配信検出結果を確認してください。プレビューではGemini APIを利用するため、利用料金・割当の対象になります。
-6. 問題なければ `DRY_RUN` を `false` に変更し、`processLatestImageAndLog()` を一度実行します。この操作は実際にYouTubeへ投稿します。Xを有効にした場合はXへも投稿します。シートと実際のチャットを確認してください。
+6. 問題なければ `DRY_RUN` を `false` に変更し、`processLatestImageAndLog()` を一度実行します。この操作は実際にYouTubeへ投稿します。X・Instagramを有効にした場合はそれらにも投稿します。シートと実際のチャットを確認してください。
 7. `installTenMinuteTrigger()` を実行します。同じアカウントが作成した `processLatestImageAndLog` のトリガーだけを置き換え、10分間隔を1つ作ります。予算に合わせて処理を待機するため、毎回投稿するわけではありません。GASの時間トリガーは厳密な10分刻みではなく、実行アカウントの権限で動作します。BOTのトリガーは1つのアカウントで管理してください。
 
 ### スクリプト プロパティ
@@ -48,6 +50,12 @@ Google Driveの最新スクリーンショットをGeminiで読み取り、蚕�
 | `LOG_SHEET_NAME` | `蚕ログ` | 専用のログシート。既存の最初のシートは変更しない |
 | `DRY_RUN` | `true` | `true`では推論・配信確認のみ。投稿と履歴保存を有効にするには`false` |
 | `ENABLE_X` | `false` | YouTubeだけなら変更不要。Xも使用する場合は`true` |
+| `ENABLE_INSTAGRAM` | `false` | Instagram画像フィード投稿を有効にする場合は`true` |
+| `INSTAGRAM_USER_ID` | Instagram有効時に必須 | Instagram Loginで取得した投稿先の数値ID |
+| `INSTAGRAM_ACCESS_TOKEN` | Instagram有効時に必須 | Instagram User access token（basic・content_publish権限） |
+| `INSTAGRAM_IMAGE_URL_TEMPLATE` | Instagram有効時に必須 | `{digest}` を含む公開HTTPS JPEG URL。`{fileId}` も利用可能 |
+| `INSTAGRAM_API_VERSION` | `v25.0` | Instagram APIの固定バージョン |
+| `INSTAGRAM_DAILY_POST_BUDGET` | `1` | 失敗を含む試行数/UTC日。間隔も `24時間 / 予算` 以上 |
 | `MAX_IMAGE_AGE_MINUTES` | `20` | 更新されていない画像を投稿しないための上限 |
 | `LIVE_SEARCH_INTERVAL_MINUTES` | `60` | 他アカウントから配信を探す場合の検索間隔。60以上 |
 | `GEMINI_DAILY_REQUEST_BUDGET` | `16` | 失敗・プレビューを含む試行数/日。解析間隔は最短10分と `1440 / 予算` の長い方 |
@@ -90,6 +98,10 @@ GASの「ライブラリ」に、公式 **OAuth1** を追加します。
 - Geminiの429は次のPacific日次境界とAPIの待機指示の遅い方まで停止します。5xxも即時リトライせず待機します。Xの429・レート残量・resetヘッダーも反映し、同じ文面の連続投稿を見送ります。日本語の短文は70文字以内に制限します。
 - 予算と待機時刻は `YOSAN_LIMITS_V1`、プレビューの解析キャッシュは `YOSAN_PREVIEW_V1` に保存します。同じ画像のプレビュー結果は本番でも再利用します。`showBotUsage()` で、秘密鍵を表示せずBOTの予約済み試行数と直近の実トークン数を確認できます。
 
+### Instagramも利用する場合
+
+[導入手順](導入手順.md)に従い、Instagram API with Instagram Loginのプロアカウントと公開JPEG URLを準備します。プレビューではInstagramへアクセスしません。投稿コンテナを保存して準備完了後に公開し、結果が不明なら自動再送を止めます。コンテナの `ERROR`・`EXPIRED` は `failed` として停止します。公開サーバーへのアップロードとトークン更新は別途必要です。
+
 ### 投稿結果が不明になった場合
 
 GASのスクリプト プロパティ `YOSAN_STATE_V1` に、最新画像の推論結果・履歴保存済みフラグ・投稿先ごとの状態が保存されます。
@@ -101,9 +113,9 @@ GASのスクリプト プロパティ `YOSAN_STATE_V1` に、最新画像の推�
 | `sent` | 成功応答を取得済み。この画像は同じ投稿先へ再送しない |
 | `unknown` | タイムアウト、5xx、YouTube投稿の例外などで成功したか不明。二重投稿を避けるため同じ画像を自動再送しない |
 
-YouTubeとXには、このGASが利用できる共通の投稿・状態保存トランザクションがありません。厳密な「必ず一度だけの配信」は保証できず、応答が不明な場合は自動再送を止める設計です。Xの明確な4xx拒否（408を除く）は `pending` に戻します。
+YouTube・X・Instagramには、このGASが利用できる共通の投稿・状態保存トランザクションがありません。厳密な「必ず一度だけの配信」は保証できず、応答が不明な場合は自動再送を止める設計です。Xの明確な4xx拒否（408を除く）は `pending` に戻します。
 
-復旧するときは `removeBotTriggers()` で停止し、実際のチャットやXを確認してください。**まだ保存状態と同じ画像を再処理する必要がある場合に限り**、未投稿を確認した側の状態を `pending`、投稿済みを確認した側を `sent` に修正します。他のフィールドは維持します。状態を丸ごと削除すると、推論・投稿をやり直して重複する可能性があります。新しい画像への切り替え後は、通常の処理に任せてください。
+復旧するときは `removeBotTriggers()` で停止し、実際のチャット・X・Instagramを確認してください。**まだ保存状態と同じ画像を再処理する必要がある場合に限り**、未投稿を確認した側の状態を `pending`、投稿済みを確認した側を `sent` に修正します。他のフィールドは維持します。状態を丸ごと削除すると、推論・投稿をやり直して重複する可能性があります。新しい画像への切り替え後は、通常の処理に任せてください。
 
 トリガーを停止したい場合は `removeBotTriggers()` を実行します。この関数は実行アカウントのBOT用トリガーだけを削除します。
 
@@ -112,10 +124,12 @@ YouTubeとXには、このGASが利用できる共通の投稿・状態保存ト
 Node.js 22以上で、追加パッケージのインストールなしに実行できます。
 
 ```sh
-cd /workspace/yousan
+cd kaiko_sns_bot
 npm test
 ```
 
-GAS・Gemini・YouTube・Xのサービスをモックし、本体をNodeのVMで実行します。重複防止、上書き画像、古い画像、API失敗、部分成功、状態保存失敗、履歴保存直後の中断、配信の切り替え、プレビュー、トリガー管理などを検証します。外部への投稿や実際の秘密鍵は使用しません。GAS上の認可、Drive/Sheetsへの実アクセス、モデルの利用可否、実際の投稿は、このローカルテストでは検証していません。
+GAS・Gemini・YouTube・X・Instagramのサービスをモックし、本体をNodeのVMで実行します。重複防止、上書き画像、古い画像、API失敗、部分成功、状態保存失敗、履歴保存直後の中断、配信の切り替え、プレビュー、トリガー管理などを検証します。外部への投稿や実際の秘密鍵は使用しません。GAS上の認可、Drive/Sheetsへの実アクセス、モデルの利用可否、実際の投稿は、このローカルテストでは検証していません。
+
+Instagramテストを含む66件はV8上のNode API互換実行で通過しました。クラウド環境の起動失敗により `npm test` は未実行です。実アカウントへの投稿は行っていません。
 
 参考: [Google Gen AI公式SDK](https://github.com/googleapis/js-genai)、[OAuth1公式ライブラリ](https://github.com/googleworkspace/apps-script-oauth1)、[YouTubeライブAPI](https://developers.google.com/youtube/v3/live/docs)、[X画像アップロードAPI](https://developer.x.com/en/docs/x-api/v1/media/upload-media/api-reference/post-media-upload)。
