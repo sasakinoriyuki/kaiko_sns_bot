@@ -405,8 +405,38 @@ function showBotUsage() {
   return report;
 }
 
+/** OBS直下を優先。画像がなければ直下の日付フォルダを新しい日付順に探す。 */
 function findLatestImage_(folderId) {
-  const files = DriveApp.getFolderById(folderId).getFiles();
+  const folder = DriveApp.getFolderById(folderId);
+  const directImage = findLatestImageInFolder_(folder);
+  if (directImage) return directImage;
+
+  const folders = folder.getFolders();
+  const dated = [];
+  while (folders.hasNext()) {
+    const child = folders.next();
+    const name = child.getName();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(name)) continue;
+    const date = new Date(name + 'T00:00:00Z');
+    if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== name) continue;
+    dated.push({ name: name, folder: child });
+  }
+  dated.sort(function (a, b) { return a.name < b.name ? 1 : a.name > b.name ? -1 : 0; });
+  for (let i = 0; i < dated.length;) {
+    const name = dated[i].name;
+    let latest = null;
+    // Driveには同名フォルダも作れるため、同じ日付はまとめて比較する。
+    while (i < dated.length && dated[i].name === name) {
+      const image = findLatestImageInFolder_(dated[i++].folder);
+      if (image && (!latest || image.getLastUpdated().getTime() > latest.getLastUpdated().getTime())) latest = image;
+    }
+    if (latest) return latest; // 空の日付フォルダは飛ばして、一つ前の日付へ。
+  }
+  return null;
+}
+
+function findLatestImageInFolder_(folder) {
+  const files = folder.getFiles();
   let latest = null;
   while (files.hasNext()) {
     const file = files.next();

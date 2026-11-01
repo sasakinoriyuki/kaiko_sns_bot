@@ -21,7 +21,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 function harness(options = {}) {
   let now = options.now ?? Date.now();
   const calls = { gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
-    instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
+    driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
     TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
@@ -50,6 +50,28 @@ function harness(options = {}) {
     };
   };
   const files = options.files ? options.files.map(makeFile) : [makeFile()];
+  const iterator = (items) => {
+    let index = 0;
+    return { hasNext: () => index < items.length, next: () => items[index++] };
+  };
+  const makeFolder = (record) => ({
+    getName: () => record.name,
+    getFiles: () => {
+      calls.driveFileScans.push(record.name);
+      return iterator((record.files || []).map(makeFile));
+    },
+    getFolders: () => {
+      calls.driveFolderScans.push(record.name);
+      return iterator((record.folders || []).map(makeFolder));
+    }
+  });
+  const folder = {
+    getFiles: () => { calls.driveFileScans.push('OBS'); return iterator(files); },
+    getFolders: () => {
+      calls.driveFolderScans.push('OBS');
+      return iterator((options.folders || []).map(makeFolder));
+    }
+  };
   let data = options.sheetData ? clone(options.sheetData) : [];
   let sheetExists = Boolean(options.sheetData);
   let remainingLogFailures = options.logFailures || 0;
@@ -114,10 +136,7 @@ function harness(options = {}) {
     },
     LockService: { getScriptLock: () => ({ tryLock: () => options.busy !== true, releaseLock: () => calls.releases++ }) },
     PropertiesService: { getScriptProperties: () => properties },
-    DriveApp: { getFolderById: () => ({ getFiles: () => {
-      let index = 0;
-      return { hasNext: () => index < files.length, next: () => files[index++] };
-    } }) },
+    DriveApp: { getFolderById: () => folder },
     Utilities: {
       DigestAlgorithm: { SHA_256: 'sha256' },
       computeDigest: (algorithm, bytes) => [...createHash(algorithm).update(Buffer.from(bytes)).digest()],
@@ -913,5 +932,85 @@ test('Instagramの設定不備・制限状態破損は投稿前に停止する',
     const h = instagramHarness({ properties });
     assert.throws(h.run);
     assert.equal(h.calls.instagram.length, 0);
+  }
+});
+
+
+test('OBS直下に画像があれば日付フォルダを調べず直下を優先する', () => {
+  const h = harness({ folders: [{ name: '2026-10-31', files: [{ name: 'child.png', updated: Date.now() }] }] });
+  h.run();
+  assert.equal(h.calls.logs[0][1], 'screenshot.png');
+  assert.deepEqual(h.calls.driveFolderScans, []);
+});
+
+test('OBS直下に非画像しかなければ最新の日付フォルダ内の最新画像を選ぶ', () => {
+  const now = Date.now();
+  const h = harness({ files: [{ name: 'input.txt', mime: 'text/plain' }], folders: [
+    { name: '2026-10-30', files: [{ name: 'older-date.png', updated: now }] },
+    { name: '2026-10-31', files: [
+      { name: 'old.png', updated: now - 10000 },
+      { name: 'latest.jpg', mime: 'application/octet-stream', updated: now - 1000 },
+      { name: 'input.txt', mime: 'text/plain', updated: now }
+    ] }
+  ] });
+  h.run();
+  assert.equal(h.calls.logs[0][1], 'latest.jpg');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.chats.length, 1);
+  h.run();
+  assert.equal(h.calls.chats.length, 1);
+  assert.ok(!h.calls.driveFileScans.includes('2026-10-30'));
+});
+
+test('最新の日付フォルダが空または非画像のみなら一つ前の日付を探す', () => {
+  const h = harness({ files: [], folders: [
+    { name: '2026-10-31', files: [] },
+    { name: '2026-10-30', files: [{ name: 'input.txt', mime: 'text/plain' }] },
+    { name: '2026-10-29', files: [{ name: 'fallback.png' }] }
+  ] });
+  h.run();
+  assert.equal(h.calls.logs[0][1], 'fallback.png');
+  assert.deepEqual(h.calls.driveFileScans, ['OBS', '2026-10-31', '2026-10-30', '2026-10-29']);
+});
+
+test('日付形式以外・存在しない日付・二重の下位フォルダは探さない', () => {
+  const h = harness({ files: [], folders: [
+    ...['2026-02-29', '2026-02-30', '2026-13-01', '2026-10-32', '2026-1-01', 'archive'].map(name =>
+      ({ name, files: [{ name: 'invalid.png' }] })),
+    { name: '2026-10-31', folders: [{ name: '2026-10-31', files: [{ name: 'nested.png' }] }] },
+    { name: '2024-02-29', files: [{ name: 'valid-leap-day.png' }] }
+  ] });
+  h.run();
+  assert.equal(h.calls.logs[0][1], 'valid-leap-day.png');
+  assert.deepEqual(h.calls.driveFileScans, ['OBS', '2026-10-31', '2024-02-29']);
+  assert.deepEqual(h.calls.driveFolderScans, ['OBS']);
+});
+
+test('同じ日付のフォルダが複数あればその中の最新画像を選ぶ', () => {
+  const now = Date.now();
+  const h = harness({ files: [], folders: [
+    { name: '2026-10-31', files: [{ name: 'first.png', updated: now - 10000 }] },
+    { name: '2026-10-31', files: [{ name: 'second.png', updated: now - 1000 }] }
+  ] });
+  h.run();
+  assert.equal(h.calls.logs[0][1], 'second.png');
+});
+
+test('日付フォルダにも画像がなければ解析・履歴・投稿を行わない', () => {
+  const h = harness({ files: [], folders: [{ name: '2026-10-31' }] });
+  assert.equal(h.run().status, 'no_image');
+  for (const name of ['gemini', 'logs', 'chats', 'tweets']) assert.equal(h.calls[name].length, 0);
+});
+
+test('日付フォルダの画像も20分の鮮度制限を適用し直下の古い画像も優先する', () => {
+  const stale = Date.now() - 21 * 60000;
+  for (const options of [
+    { files: [], folders: [{ name: '2026-10-31', files: [{ updated: stale }] }] },
+    { files: [{ updated: stale }], folders: [{ name: '2026-10-31', files: [{}] }] }
+  ]) {
+    const h = harness(options);
+    assert.equal(h.run().status, 'stale_image');
+    assert.equal(h.calls.gemini.length, 0);
+    assert.equal(h.calls.chats.length, 0);
   }
 });
