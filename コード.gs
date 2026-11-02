@@ -21,14 +21,15 @@ function previewLatestImage() {
   return runBot_(true);
 }
 
-function runBot_(forcePreview, triggerDriven) {
+function runBot_(forcePreview, triggerDriven, analysisOnly) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
     console.log('他の実行が処理中のためスキップしました。');
     return { status: 'busy' };
   }
   try {
-    const config = getConfig_();
+    const config = getConfig_(analysisOnly);
+    analysisOnly = Boolean(analysisOnly || config.splitAccounts);
     config.triggerDriven = Boolean(triggerDriven);
     if (config.triggerDriven) config.youtubeMinMinutes = 1; // 投稿周期は時間主導トリガーが決める。連続実行だけ1分抑制。
     const file = findLatestImage_(config.folderId);
@@ -61,9 +62,9 @@ function runBot_(forcePreview, triggerDriven) {
     if (forcePreview || config.dryRun) {
       const feeling = previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
       properties.setProperty(BOT_PREVIEW_KEY, JSON.stringify({ key: image.key, model: config.geminiModel, feeling: feeling }));
-      const live = findActiveLive_(config);
+      const live = analysisOnly ? null : findActiveLive_(config);
       console.log('プレビュー（投稿・履歴保存なし）: ' + feeling);
-      console.log(live && live.liveChatId ? '配信中のチャットを検出しました。' : '投稿可能なライブチャットはありません。');
+      console.log(analysisOnly ? '学校側の解析プレビューです。YouTubeにはアクセスしません。' : live && live.liveChatId ? '配信中のチャットを検出しました。' : '投稿可能なライブチャットはありません。');
       return { status: 'preview', feeling: feeling, videoId: live ? live.videoId : null };
     }
 
@@ -79,7 +80,7 @@ function runBot_(forcePreview, triggerDriven) {
     });
     // 同じ画像のYouTube投稿は、成功後も投稿間隔を空けて繰り返す。
     // sending/unknownは自動再送しない。旧バージョンのsent状態も安全に移行する。
-    if (state.youtube === 'sent') {
+    if (!analysisOnly && state.youtube === 'sent') {
       const lastPost = state.youtubeSentAt === undefined ? getLimitState_().youtube.lastPost : state.youtubeSentAt;
       if (lastPost === undefined) state.youtubeSentAt = Date.now();
       else if (config.triggerDriven || Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
@@ -93,7 +94,7 @@ function runBot_(forcePreview, triggerDriven) {
       state.logged = true;
       saveState_(properties, state);
     }
-    if (state.youtube === 'pending') {
+    if (!analysisOnly && state.youtube === 'pending') {
       try {
         const live = findActiveLive_(config);
         if (live && live.liveChatId) {
@@ -110,7 +111,7 @@ function runBot_(forcePreview, triggerDriven) {
         console.error('YouTube処理失敗: ' + safeError_(error));
       }
     }
-    if (config.enableX && state.x === 'pending') {
+    if (!analysisOnly && config.enableX && state.x === 'pending') {
       try {
         reserveXAttempt_(config, buildXText_(state.feeling, config));
         // 画像のアップロードは投稿ではないので、失敗時は次回に再試行できる。
@@ -123,9 +124,13 @@ function runBot_(forcePreview, triggerDriven) {
         console.error('X処理失敗: ' + safeError_(error));
       }
     }
-    if (config.enableInstagram && state.instagram === 'pending') {
+    if (!analysisOnly && config.enableInstagram && state.instagram === 'pending') {
       try { processInstagram_(properties, state, image, config); }
       catch (error) { console.error('Instagram処理失敗: ' + safeError_(error)); }
+    }
+    if (analysisOnly) {
+      console.log('画像解析・履歴保存が完了しました。YouTube投稿は個人アカウント側で実行します。');
+      return { status: 'prepared', youtube: 'queued', feeling: state.feeling };
     }
     console.log('処理結果: YouTube=' + state.youtube + ', X=' + (config.enableX ? state.x : 'disabled') + ', Instagram=' + (config.enableInstagram ? state.instagram : 'disabled'));
     return { status: 'processed', youtube: state.youtube, x: config.enableX ? state.x : 'disabled', instagram: config.enableInstagram ? state.instagram : 'disabled' };
@@ -140,7 +145,7 @@ function runBot_(forcePreview, triggerDriven) {
   }
 }
 
-function getConfig_() {
+function getConfig_(analysisOnly) {
   const values = PropertiesService.getScriptProperties().getProperties();
   const config = {
     geminiApiKey: requiredProperty_(values, 'GEMINI_API_KEY'),
@@ -150,6 +155,8 @@ function getConfig_() {
     channelId: values.CHANNEL_ID || 'UCJ12W_V5k49jE0M38L32Ylg',
     logSheetName: values.LOG_SHEET_NAME || '蚕ログ',
     dryRun: booleanProperty_(values, 'DRY_RUN', true),
+    splitAccounts: booleanProperty_(values, 'SPLIT_ACCOUNT_MODE', false),
+    videoId: analysisOnly ? null : optionalYouTubeVideoId_(values),
     enableX: booleanProperty_(values, 'ENABLE_X', false),
     enableInstagram: booleanProperty_(values, 'ENABLE_INSTAGRAM', false),
     instagramDailyBudget: integerBudgetProperty_(values, 'INSTAGRAM_DAILY_POST_BUDGET', 1),
@@ -173,6 +180,7 @@ function getConfig_() {
   if (config.searchIntervalMinutes < 60) {
     throw new Error('LIVE_SEARCH_INTERVAL_MINUTESは60以上にしてください（検索クォータ保護）。');
   }
+  if (analysisOnly || config.splitAccounts) { config.enableX = false; config.enableInstagram = false; }
   if (config.enableX) {
     ['TWITTER_API_KEY', 'TWITTER_API_SECRET', 'TWITTER_ACCESS_TOKEN', 'TWITTER_ACCESS_SECRET'].forEach(function (name) {
       config[name] = requiredProperty_(values, name);
@@ -558,6 +566,7 @@ function asSheetText_(text) {
 
 /** 配信中IDを再利用し、必ずVideos.listで現在も配信中か確認する。 */
 function findActiveLive_(config) {
+  if (config.videoId) return getLiveDetails_([config.videoId], null, config);
   const properties = PropertiesService.getScriptProperties();
   const videoKey = 'YOSAN_LIVE_VIDEO_' + config.channelId;
   // 配信所有者として実行している場合、検索より軽いliveBroadcasts.listを使う。
@@ -607,7 +616,7 @@ function getLiveDetails_(ids, channelId, config) {
   });
   const active = (response.items || []).filter(function (item) {
     const details = item.liveStreamingDetails;
-    return item.snippet && item.snippet.channelId === channelId && details &&
+    return item.snippet && (!channelId || item.snippet.channelId === channelId) && details &&
       details.actualStartTime && !details.actualEndTime;
   }).sort(function (a, b) {
     return Date.parse(b.liveStreamingDetails.actualStartTime) - Date.parse(a.liveStreamingDetails.actualStartTime);
@@ -779,7 +788,7 @@ function installTenMinuteTrigger() {
 
 function removeBotTriggers() {
   ScriptApp.getProjectTriggers().filter(function (trigger) {
-    return trigger.getHandlerFunction() === BOT_HANDLER;
+    return [BOT_HANDLER, 'analyzeLatestImageAndLog', 'postPreparedCommentToYouTube'].indexOf(trigger.getHandlerFunction()) !== -1;
   }).forEach(function (trigger) { ScriptApp.deleteTrigger(trigger); });
 }
 
@@ -876,4 +885,149 @@ function configureThirtyMinuteYouTube() {
   properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '48');
   properties.deleteProperty('MAX_IMAGE_AGE_MINUTES'); // 現在版では画像の古さを判定しない。
   console.log('手動投稿の最短間隔30分、Gemini予算48試行/日に設定しました。自動投稿の間隔はトリガー画面で変更してください。');
+}
+
+
+/** 同じGASを2アカウントで共有する運用。画像そのものはPropertiesへ保存しない。 */
+function optionalYouTubeVideoId_(values) {
+  const id = (values.YOUTUBE_VIDEO_ID || '').trim();
+  if (id && !/^[A-Za-z0-9_-]{11}$/.test(id)) throw new Error('YOUTUBE_VIDEO_IDには動画IDだけを指定してください。');
+  return id;
+}
+
+function requireBotScopes_(role, withTriggers) {
+  const scopes = role === 'school' ? [
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/script.external_request'
+  ] : ['https://www.googleapis.com/auth/youtube.force-ssl'];
+  if (withTriggers) scopes.push('https://www.googleapis.com/auth/script.scriptapp');
+  if (typeof ScriptApp.requireScopes === 'function') ScriptApp.requireScopes(ScriptApp.AuthMode.FULL, scopes);
+}
+
+/** 最初に1回だけ実行。既存の鍵・予算・投稿状態・DRY_RUNは維持する。 */
+function configureSplitAccountMode() {
+  const properties = PropertiesService.getScriptProperties();
+  properties.setProperty('SPLIT_ACCOUNT_MODE', 'true');
+  properties.setProperty('ENABLE_X', 'false');
+  properties.setProperty('ENABLE_INSTAGRAM', 'false');
+  if (!properties.getProperty('YOUTUBE_VIDEO_ID')) properties.setProperty('YOUTUBE_VIDEO_ID', 'J1XMapSSHeI');
+  console.log('学校はanalyzeLatestImageAndLog、個人はpostPreparedCommentToYouTubeを使ってください。');
+}
+
+/** 学校アカウントで実行：Drive・Gemini・Sheetsのみ。 */
+function analyzeLatestImageAndLog(event) {
+  requireBotScopes_('school', false);
+  return runBot_(false, Boolean(event && event.triggerUid), true);
+}
+
+function previewSchoolAnalysis() {
+  requireBotScopes_('school', false);
+  return runBot_(true, false, true);
+}
+
+/** 個人側ではGEMINI_API_KEYやDrive/Sheetsに依存しない。 */
+function getYouTubeOnlyConfig_(event) {
+  const properties = PropertiesService.getScriptProperties();
+  const values = {};
+  ['DRY_RUN', 'CHANNEL_ID', 'YOUTUBE_VIDEO_ID', 'LIVE_SEARCH_INTERVAL_MINUTES',
+    'YOUTUBE_DAILY_UNIT_BUDGET', 'YOUTUBE_MIN_INTERVAL_MINUTES'].forEach(function (name) {
+    const value = properties.getProperty(name);
+    if (value !== null) values[name] = value;
+  });
+  const config = {
+    dryRun: booleanProperty_(values, 'DRY_RUN', true),
+    channelId: values.CHANNEL_ID || 'UCJ12W_V5k49jE0M38L32Ylg',
+    videoId: optionalYouTubeVideoId_(values),
+    searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60),
+    youtubeDailyBudget: integerBudgetProperty_(values, 'YOUTUBE_DAILY_UNIT_BUDGET', 8000),
+    youtubeMinMinutes: positiveNumberProperty_(values, 'YOUTUBE_MIN_INTERVAL_MINUTES', 30),
+    triggerDriven: Boolean(event && event.triggerUid)
+  };
+  if (config.searchIntervalMinutes < 60 || config.youtubeMinMinutes < 10) throw new Error('検索は60分以上、手動投稿は10分以上の間隔にしてください。');
+  if (config.triggerDriven) config.youtubeMinMinutes = 1;
+  return config;
+}
+
+function previewYouTubeConnection() {
+  requireBotScopes_('youtube', false);
+  const config = getYouTubeOnlyConfig_();
+  const live = findActiveLive_(config);
+  console.log(live && live.liveChatId ? 'YouTubeの配信中チャットを取得できました。投稿はしていません。' :
+    '投稿可能なライブチャットがありません。動画ID・配信中・チャット有効・実行アカウントを確認してください。');
+  return { status: live && live.liveChatId ? 'ready' : 'no_live', videoId: live ? live.videoId : null };
+}
+
+/** 個人アカウントで実行：共有Propertiesの解析済み実況文だけをYouTubeへ投稿。 */
+function postPreparedCommentToYouTube(event) {
+  requireBotScopes_('youtube', false);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return { status: 'busy' };
+  try {
+    const config = getYouTubeOnlyConfig_(event);
+    const properties = PropertiesService.getScriptProperties();
+    const state = readJsonProperty_(properties, BOT_STATE_KEY);
+    if (!state || !state.logged || typeof state.feeling !== 'string' || !state.feeling.trim()) {
+      console.log('学校側の解析・履歴保存を待っています。先にanalyzeLatestImageAndLogを実行してください。');
+      return { status: 'waiting_analysis' };
+    }
+    if (config.dryRun) {
+      console.log('投稿しない確認モードです。実投稿する場合はDRY_RUN=falseにしてください。');
+      return { status: 'preview', feeling: state.feeling };
+    }
+    if (state.youtube === 'sending') {
+      state.youtube = 'unknown';
+      saveState_(properties, state);
+    }
+    if (state.youtube === 'unknown') {
+      console.log('前回の投稿結果が不明です。実際のチャットを確認してください。自動再送はしません。');
+      return { status: 'unknown', youtube: 'unknown' };
+    }
+    if (state.youtube === 'sent') {
+      const lastPost = state.youtubeSentAt === undefined ? getLimitState_().youtube.lastPost : state.youtubeSentAt;
+      if (lastPost === undefined) {
+        state.youtubeSentAt = Date.now();
+        saveState_(properties, state);
+        return { status: 'processed', youtube: 'sent' };
+      }
+      if (!config.triggerDriven && Date.now() - lastPost < config.youtubeMinMinutes * 60000) {
+        return { status: 'processed', youtube: 'sent' };
+      }
+      state.youtube = 'pending';
+    }
+    if (state.youtube === undefined) state.youtube = 'pending';
+    if (state.youtube !== 'pending') throw new Error('YouTubeの保存状態を確認してください。');
+    const live = findActiveLive_(config);
+    if (!live || !live.liveChatId) {
+      console.log('個人側でライブチャットが見つかりません。動画ID・配信中・チャット有効を確認してください。');
+      return { status: 'no_live', youtube: 'pending' };
+    }
+    sendWithState_(properties, state, 'youtube', function () {
+      const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
+      state.youtubeSentAt = Date.now();
+      return id;
+    });
+    return { status: 'processed', youtube: state.youtube };
+  } catch (error) {
+    console.error('個人側YouTube処理: ' + safeError_(error));
+    return { status: error.botWait ? 'rate_limited' : 'error' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function installSchoolAnalysisTrigger() {
+  requireBotScopes_('school', true);
+  if (getConfig_(true).dryRun) throw new Error('DRY_RUN=falseにしてから自動運転を開始してください。');
+  removeBotTriggers(); // 自分のトリガーだけを整理する。
+  ScriptApp.newTrigger('analyzeLatestImageAndLog').timeBased().everyMinutes(30).create();
+  console.log('学校側の解析トリガーを30分で作成しました。間隔はトリガー画面で変更できます。');
+}
+
+function installPersonalYouTubeTrigger() {
+  requireBotScopes_('youtube', true);
+  if (getYouTubeOnlyConfig_().dryRun) throw new Error('DRY_RUN=falseにしてから自動運転を開始してください。');
+  removeBotTriggers();
+  ScriptApp.newTrigger('postPreparedCommentToYouTube').timeBased().everyMinutes(30).create();
+  console.log('個人側の投稿トリガーを30分で作成しました。間隔はトリガー画面で変更できます。');
 }

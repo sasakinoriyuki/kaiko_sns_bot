@@ -21,7 +21,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 function harness(options = {}) {
   let now = options.now ?? Date.now();
   const calls = { gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
-    driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
+    scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
     TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
@@ -196,6 +196,11 @@ function harness(options = {}) {
     },
     OAuth1: { createService: () => service },
     ScriptApp: {
+      AuthMode: { FULL: 'FULL' },
+      requireScopes: (mode, scopes) => {
+        calls.scopes.push({ mode, scopes: [...scopes] });
+        if (options.allowedScopes && scopes.some(scope => !options.allowedScopes.includes(scope))) throw new Error('forbidden scope');
+      },
       getProjectTriggers: () => [...triggers],
       deleteTrigger: (trigger) => triggers.splice(triggers.indexOf(trigger), 1),
       newTrigger(handler) {
@@ -1131,4 +1136,183 @@ test('30分トリガーの作成・再作成で他のトリガーを維持する
   h.context.installThirtyMinuteTrigger();
   h.context.installThirtyMinuteTrigger();
   assert.deepEqual(h.triggers.map(x => x.getHandlerFunction()), ['otherHandler', 'processLatestImageAndLog']);
+});
+
+
+const SCHOOL_SCOPES = ['drive.readonly', 'spreadsheets', 'script.external_request', 'script.scriptapp']
+  .map(s => 'https://www.googleapis.com/auth/' + s);
+const PERSONAL_SCOPES = ['youtube.force-ssl', 'script.scriptapp']
+  .map(s => 'https://www.googleapis.com/auth/' + s);
+function preparedSchool(options = {}) {
+  const h = harness({ ...options, allowedScopes: SCHOOL_SCOPES, properties: {
+    SPLIT_ACCOUNT_MODE: 'true', ENABLE_X: 'true', TWITTER_API_KEY: undefined, ...options.properties
+  } });
+  delete h.context.YouTube;
+  return h;
+}
+function personalWithPrepared(school, options = {}) {
+  const h = harness({ ...options, allowedScopes: PERSONAL_SCOPES, properties: {
+    ...school.values, GEMINI_API_KEY: undefined, YOUTUBE_VIDEO_ID: 'J1XMapSSHeI', ...options.properties
+  } });
+  h.setVideos([h.liveVideo({ id: 'J1XMapSSHeI', snippet: { channelId: 'actual-video-channel' } })]);
+  delete h.context.DriveApp; delete h.context.SpreadsheetApp; delete h.context.UrlFetchApp;
+  h.context.PropertiesService.getScriptProperties().getProperties = () => { throw new Error('個人側で全設定を読み取らない'); };
+  return h;
+}
+
+test('学校側はYouTubeの権限・APIなしで画像解析と記録だけを行う', () => {
+  const h = preparedSchool();
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.state().logged, true);
+  assert.ok(h.calls.scopes.every(call => !call.scopes.some(s => s.includes('youtube'))));
+  assert.ok(!h.values.YOSAN_STATE_V1.includes('base64'));
+});
+
+test('学校用プレビューはYouTubeへ接続せず解析だけを確認する', () => {
+  const h = preparedSchool();
+  assert.equal(h.context.previewSchoolAnalysis().status, 'preview');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.values.YOSAN_STATE_V1, undefined);
+});
+
+test('分担モードでは旧ハンドラーを学校側で使ってもYouTubeを呼ばない', () => {
+  const h = preparedSchool();
+  assert.equal(h.run().status, 'prepared');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('個人側はDrive・Sheets・Geminiキーなしで共有された実況文を投稿する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 1);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.driveFileScans.length, 0);
+  assert.equal(h.calls.searches.length, 0);
+  assert.equal(h.calls.channels, 0);
+  assert.equal(h.calls.videos[0].params.id, 'J1XMapSSHeI');
+  assert.ok(h.calls.scopes.every(call => call.scopes.every(s => s.includes('youtube'))));
+  h.advance(5 * 60000);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 2);
+});
+
+test('学校側の同じ画像の再実行は個人側の投稿済み状態を変えない', () => {
+  const h = preparedSchool(); h.context.analyzeLatestImageAndLog();
+  const state = h.state(); state.youtube = 'sent'; state.youtubeSentAt = h.now() - 3600000;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(h.state().youtube, 'sent');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('学校側の準備や記録が未完了なら個人側は投稿しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  for (const state of [undefined, { ...school.state(), logged: false }, { ...school.state(), feeling: '' }]) {
+    const h = personalWithPrepared(school, { properties: { YOSAN_STATE_V1: state && JSON.stringify(state) } });
+    assert.equal(h.context.postPreparedCommentToYouTube().status, 'waiting_analysis');
+    assert.equal(h.calls.chats.length, 0);
+    assert.equal(h.calls.videos.length, 0);
+  }
+});
+
+test('個人側もDRY_RUNでは投稿せず保存済みの文だけ返す', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { properties: { DRY_RUN: 'true' } });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'preview');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('個人側の通信失敗・成功保存失敗でも不明な投稿を自動再送しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  for (const options of [
+    { chatFailure: new Error('timeout private-token') },
+    { failPropertyWrite: (name, value) => name === 'YOSAN_STATE_V1' && JSON.parse(value).youtube === 'sent' }
+  ]) {
+    const h = personalWithPrepared(school, options);
+    h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+    assert.equal(h.state().youtube, 'unknown');
+    h.advance(30 * 60000);
+    assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'unknown');
+    assert.equal(h.calls.chats.length, 1);
+    assert.ok(!h.calls.console.join('\n').includes('private-token'));
+  }
+});
+
+test('個人側も送信前の状態保存ができなければ投稿を始めない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { failPropertyWrite: (name, value) =>
+    name === 'YOSAN_STATE_V1' && JSON.parse(value).youtube === 'sending' });
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('個人側の配信確認は実況文・画像の準備なしで行えて投稿しない', () => {
+  const school = preparedSchool();
+  const h = personalWithPrepared(school);
+  assert.equal(h.context.previewYouTubeConnection().status, 'ready');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('指定動画が終了済みやチャットなしなら個人側も待機する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  h.setVideos([h.liveVideo({ id: 'J1XMapSSHeI', liveStreamingDetails: { actualStartTime: '2026-01-01', actualEndTime: '2026-01-02' } })]);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'no_live');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('個人側のAPI予算と連続発火制限を引き続き守る', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const limited = personalWithPrepared(school, { properties: { YOUTUBE_DAILY_UNIT_BUDGET: '1' } });
+  assert.equal(limited.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'rate_limited');
+  assert.equal(limited.calls.chats.length, 0);
+  const h = personalWithPrepared(school);
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('アカウント別のトリガー作成で不要な権限を要求しない', () => {
+  const school = preparedSchool({ triggers: ['otherHandler', 'processLatestImageAndLog'] });
+  school.context.installSchoolAnalysisTrigger();
+  assert.deepEqual(school.triggers.map(t => t.getHandlerFunction()), ['otherHandler', 'analyzeLatestImageAndLog']);
+  assert.ok(school.calls.scopes.every(call => !call.scopes.some(s => s.includes('youtube'))));
+  const personal = personalWithPrepared(school, { triggers: ['otherHandler', 'postPreparedCommentToYouTube'] });
+  personal.context.installPersonalYouTubeTrigger();
+  assert.deepEqual(personal.triggers.map(t => t.getHandlerFunction()), ['otherHandler', 'postPreparedCommentToYouTube']);
+});
+
+test('分担設定はキー・予算・既存の投稿状態を維持して動画IDを設定する', () => {
+  const h = harness(); h.run();
+  const state = h.values.YOSAN_STATE_V1, limits = h.values.YOSAN_LIMITS_V1;
+  h.context.configureSplitAccountMode();
+  assert.equal(h.values.SPLIT_ACCOUNT_MODE, 'true');
+  assert.equal(h.values.ENABLE_X, 'false');
+  assert.equal(h.values.ENABLE_INSTAGRAM, 'false');
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, 'J1XMapSSHeI');
+  assert.equal(h.values.GEMINI_API_KEY, 'test-gemini-key');
+  assert.equal(h.values.YOSAN_STATE_V1, state);
+  assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+});
+
+test('動画ID指定にはURLを受け付けず、別の有効な設定済みIDは維持する', () => {
+  const h = harness({ properties: { YOUTUBE_VIDEO_ID: 'https://youtube.com/watch?v=J1XMapSSHeI' } });
+  assert.throws(() => h.context.getYouTubeOnlyConfig_(), /動画ID/);
+  h.values.YOUTUBE_VIDEO_ID = 'ABCDEFGHIJK';
+  h.context.configureSplitAccountMode();
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, 'ABCDEFGHIJK');
+});
+
+
+test('学校側の処理は個人側の動画ID設定ミスにも依存しない', () => {
+  const h = preparedSchool({ properties: { YOUTUBE_VIDEO_ID: 'invalid-url' } });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 1);
 });

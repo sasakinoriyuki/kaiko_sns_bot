@@ -28,6 +28,12 @@ Instagramのアカウント準備・認証・公開画像URL・投稿テスト�
 | YouTube成功後にXが失敗すると、次回に両方を再投稿 | 投稿先ごとの状態を保存し、成功した側を再送しない |
 | 手動実行・エラー再試行が割当を消費する | プレビュー・失敗も試行に数え、最短間隔・日次/31日予算・429待機を永続化 |
 
+## 学校アカウントでYouTubeが制限されている場合
+
+同じGASを個人アカウントへ編集共有し、学校は `analyzeLatestImageAndLog` でDrive・Gemini・Sheetsだけ、個人は `postPreparedCommentToYouTube` で共有済みの実況文だけを投稿できます。個人側にDrive/Sheetsのアクセス権は不要です。具体的な切り替え・認可・2本のトリガー設定は[アカウント分担の使い方](アカウント分担の使い方.md)を参照してください。
+
+`configureSplitAccountMode` で分担モードにすると、旧 `processLatestImageAndLog` も解析のみになります。`YOUTUBE_VIDEO_ID` を指定した場合は、その動画を直接確認します。空なら従来のチャンネル検索を使います。Google側のOAuth・外部共有制限は別途適用されます。
+
 ## GASへの導入
 
 1. 対象のGASプロジェクトで、既存の同名関数を含むコードを `コード.gs` の内容に置き換えます。元のトリガーが動作中なら、編集前に停止してください。別のファイルに元の関数・定数を残すと名前が衝突します。
@@ -49,6 +55,8 @@ Instagramのアカウント準備・認証・公開画像URL・投稿テスト�
 | `CHANNEL_ID` | `UCJ12W_V5k49jE0M38L32Ylg` | 配信対象チャンネル |
 | `LOG_SHEET_NAME` | `蚕ログ` | 専用のログシート。既存の最初のシートは変更しない |
 | `DRY_RUN` | `true` | `true`では推論・配信確認のみ。投稿と履歴保存を有効にするには`false` |
+| `SPLIT_ACCOUNT_MODE` | `false` | 学校と個人の分担モード。専用関数・トリガーは分担ガイド参照 |
+| `YOUTUBE_VIDEO_ID` | 未指定 | 指定動画を直接確認する11文字のID。空ならチャンネルの自動検出 |
 | `ENABLE_X` | `false` | YouTubeだけなら変更不要。Xも使用する場合は`true` |
 | `ENABLE_INSTAGRAM` | `false` | Instagram画像フィード投稿を有効にする場合は`true` |
 | `INSTAGRAM_USER_ID` | Instagram有効時に必須 | Instagram Loginで取得した投稿先の数値ID |
@@ -137,6 +145,6 @@ npm test
 
 GAS・Gemini・YouTube・X・Instagramのサービスをモックし、本体をNodeのVMで実行します。重複防止、上書き画像、古い画像、API失敗、部分成功、状態保存失敗、履歴保存直後の中断、配信の切り替え、プレビュー、トリガー管理などを検証します。外部への投稿や実際の秘密鍵は使用しません。GAS上の認可、Drive/Sheetsへの実アクセス、モデルの利用可否、実際の投稿は、このローカルテストでは検証していません。
 
-古い画像の処理・同じ画像の30分投稿を含む合計84件はV8上のNode API互換実行で通過しました。クラウド環境の起動失敗により `npm test` は未実行です。実アカウントへの投稿は行っていません。
+古い画像の処理・同じ画像の30分投稿を含む合計100件はV8上のNode API互換実行で通過しました。クラウド環境の起動失敗により `npm test` は未実行です。実アカウントへの投稿は行っていません。
 
 参考: [Google Gen AI公式SDK](https://github.com/googleapis/js-genai)、[OAuth1公式ライブラリ](https://github.com/googleworkspace/apps-script-oauth1)、[YouTubeライブAPI](https://developers.google.com/youtube/v3/live/docs)、[X画像アップロードAPI](https://developer.x.com/en/docs/x-api/v1/media/upload-media/api-reference/post-media-upload)。
