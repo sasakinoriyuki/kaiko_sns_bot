@@ -25,7 +25,7 @@ function harness(options = {}) {
   const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
     TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
-    GEMINI_DAILY_REQUEST_BUDGET: '144', X_DAILY_POST_BUDGET: '48', X_31DAY_POST_BUDGET: '1600',
+    GEMINI_DAILY_REQUEST_BUDGET: '144', YOUTUBE_MIN_INTERVAL_MINUTES: '10', X_DAILY_POST_BUDGET: '48', X_31DAY_POST_BUDGET: '1600',
     ...options.properties };
   const properties = {
     getProperties: () => ({ ...values }),
@@ -255,13 +255,18 @@ test('同じファイルIDへの上書きも新しい画像として処理する
   assert.equal(h.calls.videos.length, 2);
 });
 
-test('空フォルダと古い画像ではAPIを呼ばない', () => {
-  for (const [files, expected] of [[[], 'no_image'], [[{ updated: Date.now() - 21 * 60000 }], 'stale_image']]) {
-    const h = harness({ files });
-    assert.equal(h.run().status, expected);
-    assert.equal(h.calls.gemini.length, 0);
-    assert.equal(h.calls.chats.length, 0);
-  }
+test('空フォルダではAPIを呼ばない', () => {
+  const h = harness({ files: [] });
+  assert.equal(h.run().status, 'no_image');
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('古い画像でも処理し、旧MAX_IMAGE_AGE_MINUTESは無視する', () => {
+  const h = harness({ files: [{ updated: Date.now() - 30 * 86400000 }], properties: { MAX_IMAGE_AGE_MINUTES: '1' } });
+  assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.ok(!h.calls.console.join('\n').includes('最新画像が古いため'));
 });
 
 test('octet-streamでも実データがPNGなら正しいMIMEを使う', () => {
@@ -376,7 +381,7 @@ test('YouTube成功後にXが429で失敗した場合、Xだけを再試行す�
   h.advance(24 * 3600000);
   h.run();
   assert.equal(h.calls.gemini.length, 1);
-  assert.equal(h.calls.chats.length, 1);
+  assert.equal(h.calls.chats.length, 2);
   assert.equal(h.calls.tweets.length, 2);
   assert.equal(h.state().x, 'sent');
 });
@@ -408,7 +413,7 @@ test('X画像アップロード失敗なら次回再試行できる', () => {
   h.advance(30 * 60000);
   h.run();
   assert.equal(h.calls.uploads.length, 2);
-  assert.equal(h.calls.chats.length, 1);
+  assert.equal(h.calls.chats.length, 2);
   assert.equal(h.calls.tweets.length, 1);
 });
 
@@ -546,7 +551,7 @@ test('Xを無効にすればOAuth1ライブラリとX秘密鍵は不要', () => 
 test('設定不備・保存状態破損は黙って処理済み状態を消さず停止する', () => {
   const cases = [
     { GEMINI_API_KEY: undefined }, { GEMINI_MODEL: 'bad/model?key=secret' },
-    { DRY_RUN: 'FALSE' }, { MAX_IMAGE_AGE_MINUTES: '-1' },
+    { DRY_RUN: 'FALSE' }, { GEMINI_DAILY_REQUEST_BUDGET: '-1' },
     { LIVE_SEARCH_INTERVAL_MINUTES: '10' }, { YOSAN_STATE_V1: 'broken' }
   ];
   for (const properties of cases) {
@@ -583,22 +588,22 @@ test('例外の生メッセージや接続URLをログへ流さない', () => {
   assert.throws(failure.run, (error) => !error.message.includes('private-key'));
 });
 
-test('初期予算で24時間の10分トリガーを動かすとGemini・YouTubeは16回まで', () => {
+test('初期予算で24時間の10分トリガーを動かすとGemini・YouTubeは48回まで', () => {
   const h = harness({ now: Date.parse('2026-10-07T07:00:00Z'), properties: {
-    GEMINI_DAILY_REQUEST_BUDGET: undefined, ENABLE_X: 'false'
+    GEMINI_DAILY_REQUEST_BUDGET: undefined, YOUTUBE_MIN_INTERVAL_MINUTES: undefined, ENABLE_X: 'false'
   } });
   for (let i = 0; i < 144; i++) {
     if (i) h.advance(10 * 60000);
     h.refreshImage();
     h.run();
   }
-  assert.equal(h.calls.gemini.length, 16);
-  assert.equal(h.calls.chats.length, 16);
-  assert.equal(h.calls.logs.length, 16);
+  assert.equal(h.calls.gemini.length, 48);
+  assert.equal(h.calls.chats.length, 48);
+  assert.equal(h.calls.logs.length, 48);
   for (let i = 1; i < h.calls.gemini.length; i++) {
-    assert.ok(h.calls.gemini[i].at - h.calls.gemini[i - 1].at >= 90 * 60000);
+    assert.ok(h.calls.gemini[i].at - h.calls.gemini[i - 1].at >= 30 * 60000);
   }
-  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.count, 16 * 53);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.count, 48 * 53);
 });
 
 test('予算確認後の10分/30分設定を24時間動かして144解析・48X試行を超えない', () => {
@@ -1002,15 +1007,93 @@ test('日付フォルダにも画像がなければ解析・履歴・投稿を�
   for (const name of ['gemini', 'logs', 'chats', 'tweets']) assert.equal(h.calls[name].length, 0);
 });
 
-test('日付フォルダの画像も20分の鮮度制限を適用し直下の古い画像も優先する', () => {
+test('日付フォルダの古い画像も処理し直下の古い画像を引き続き優先する', () => {
   const stale = Date.now() - 21 * 60000;
   for (const options of [
     { files: [], folders: [{ name: '2026-10-31', files: [{ updated: stale }] }] },
     { files: [{ updated: stale }], folders: [{ name: '2026-10-31', files: [{}] }] }
   ]) {
     const h = harness(options);
-    assert.equal(h.run().status, 'stale_image');
-    assert.equal(h.calls.gemini.length, 0);
-    assert.equal(h.calls.chats.length, 0);
+    assert.equal(h.run().youtube, 'sent');
+    assert.equal(h.calls.gemini.length, 1);
+    assert.equal(h.calls.chats.length, 1);
   }
+});
+
+
+test('初期設定で同じ古い画像を30分ごとに投稿し解析と履歴は再利用する', () => {
+  const h = harness({ files: [{ updated: Date.now() - 100 * 86400000 }], properties: {
+    YOUTUBE_MIN_INTERVAL_MINUTES: undefined, GEMINI_DAILY_REQUEST_BUDGET: undefined, ENABLE_X: 'false'
+  } });
+  assert.equal(h.context.getConfig_().youtubeMinMinutes, 30);
+  assert.equal(h.context.getConfig_().geminiDailyBudget, 48);
+  h.run(); h.advance(29 * 60000); h.run();
+  assert.equal(h.calls.chats.length, 1);
+  h.advance(60000); h.run(); h.run();
+  assert.equal(h.calls.chats.length, 2);
+  h.advance(30 * 60000); h.run();
+  assert.equal(h.calls.chats.length, 3);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText,
+    h.calls.chats[2].payload.snippet.textMessageDetails.messageText);
+});
+
+test('24時間同じ画像でもYouTube48回、Geminiと履歴は1回だけ', () => {
+  const h = harness({ now: Date.parse('2026-11-02T08:00:00Z'), properties: {
+    YOUTUBE_MIN_INTERVAL_MINUTES: undefined, GEMINI_DAILY_REQUEST_BUDGET: undefined, ENABLE_X: 'false'
+  } });
+  for (let i = 0; i < 144; i++) { if (i) h.advance(10 * 60000); h.run(); }
+  assert.equal(h.calls.chats.length, 48);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+  for (let i = 1; i < h.calls.chats.length; i++) assert.ok(h.calls.chats[i].at - h.calls.chats[i-1].at >= 30 * 60000);
+});
+
+test('同じ画像の再投稿結果が不明なら30分後も再送しない', () => {
+  const h = harness({ properties: { YOUTUBE_MIN_INTERVAL_MINUTES: '30' } });
+  h.run();
+  let attempts = 0;
+  h.context.YouTube.LiveChatMessages.insert = () => { attempts++; throw new Error('timeout'); };
+  h.advance(30 * 60000); h.run();
+  assert.equal(h.state().youtube, 'unknown');
+  h.advance(30 * 60000); h.run();
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(attempts, 1);
+});
+
+test('旧sent状態は保存済みの最終投稿時刻を使って30分後に再投稿する', () => {
+  const h = harness({ properties: { YOUTUBE_MIN_INTERVAL_MINUTES: '30' } });
+  h.run();
+  const state = h.state(); delete state.youtubeSentAt;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  h.advance(29 * 60000); h.run();
+  assert.equal(h.calls.chats.length, 1);
+  h.advance(60000); h.run();
+  assert.equal(h.calls.chats.length, 2);
+});
+
+test('最終投稿時刻もない旧sent状態は移行時にすぐ再投稿しない', () => {
+  const h = harness({ properties: { YOUTUBE_MIN_INTERVAL_MINUTES: '30' } });
+  h.run();
+  const state = h.state(); delete state.youtubeSentAt;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1); delete limits.youtube.lastPost;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  h.run(); assert.equal(h.calls.chats.length, 1);
+  h.advance(30 * 60000); h.run();
+  assert.equal(h.calls.chats.length, 2);
+});
+
+test('30分設定の移行関数は認証・投稿済み状態・使用済み予算を維持する', () => {
+  const h = harness({ properties: { MAX_IMAGE_AGE_MINUTES: '20' } });
+  h.run();
+  const state = h.values.YOSAN_STATE_V1, limits = h.values.YOSAN_LIMITS_V1;
+  h.context.configureThirtyMinuteYouTube();
+  assert.equal(h.values.YOUTUBE_MIN_INTERVAL_MINUTES, '30');
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '48');
+  assert.equal(h.values.MAX_IMAGE_AGE_MINUTES, undefined);
+  assert.equal(h.values.GEMINI_API_KEY, 'test-gemini-key');
+  assert.equal(h.values.YOSAN_STATE_V1, state);
+  assert.equal(h.values.YOSAN_LIMITS_V1, limits);
 });

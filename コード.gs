@@ -35,10 +35,6 @@ function runBot_(forcePreview) {
       return { status: 'no_image' };
     }
     const modifiedTime = file.getLastUpdated().getTime();
-    if (Date.now() - modifiedTime > config.maxImageAgeMinutes * 60000) {
-      console.log('最新画像が古いため、投稿せず次の画像を待ちます。');
-      return { status: 'stale_image' };
-    }
     if (file.getSize() > MAX_IMAGE_BYTES) {
       throw new Error('画像は5 MiB以下のPNG/JPEGにしてください。');
     }
@@ -79,6 +75,13 @@ function runBot_(forcePreview) {
     ['youtube', 'x', 'instagram'].forEach(function (platform) {
       if (state[platform] === 'sending') state[platform] = 'unknown';
     });
+    // 同じ画像のYouTube投稿は、成功後も投稿間隔を空けて繰り返す。
+    // sending/unknownは自動再送しない。旧バージョンのsent状態も安全に移行する。
+    if (state.youtube === 'sent') {
+      const lastPost = state.youtubeSentAt === undefined ? getLimitState_().youtube.lastPost : state.youtubeSentAt;
+      if (lastPost === undefined) state.youtubeSentAt = Date.now();
+      else if (Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
+    }
     if (!state.feeling) {
       state.feeling = previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
     }
@@ -93,7 +96,9 @@ function runBot_(forcePreview) {
         const live = findActiveLive_(config);
         if (live && live.liveChatId) {
           sendWithState_(properties, state, 'youtube', function () {
-            return postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
+            const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
+            state.youtubeSentAt = Date.now();
+            return id;
           });
         } else {
           console.log('ライブ未開始、終了、またはチャット無効のためYouTube投稿を待機します。');
@@ -146,11 +151,10 @@ function getConfig_() {
     enableX: booleanProperty_(values, 'ENABLE_X', false),
     enableInstagram: booleanProperty_(values, 'ENABLE_INSTAGRAM', false),
     instagramDailyBudget: integerBudgetProperty_(values, 'INSTAGRAM_DAILY_POST_BUDGET', 1),
-    maxImageAgeMinutes: positiveNumberProperty_(values, 'MAX_IMAGE_AGE_MINUTES', 20),
     searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60),
-    geminiDailyBudget: integerBudgetProperty_(values, 'GEMINI_DAILY_REQUEST_BUDGET', 16),
+    geminiDailyBudget: integerBudgetProperty_(values, 'GEMINI_DAILY_REQUEST_BUDGET', 48),
     youtubeDailyBudget: integerBudgetProperty_(values, 'YOUTUBE_DAILY_UNIT_BUDGET', 8000),
-    youtubeMinMinutes: positiveNumberProperty_(values, 'YOUTUBE_MIN_INTERVAL_MINUTES', 10),
+    youtubeMinMinutes: positiveNumberProperty_(values, 'YOUTUBE_MIN_INTERVAL_MINUTES', 30),
     xMinMinutes: positiveNumberProperty_(values, 'X_MIN_INTERVAL_MINUTES', 30),
     xDailyBudget: integerBudgetProperty_(values, 'X_DAILY_POST_BUDGET', 1),
     xMonthlyBudget: integerBudgetProperty_(values, 'X_31DAY_POST_BUDGET', 40)
@@ -272,7 +276,7 @@ function reserveGeminiAttempt_(config) {
   checkCooldown_(row, 'Gemini');
   resetDailyCounter_(row);
   if ((row.count || 0) >= config.geminiDailyBudget) throw waitError_('GeminiのBOT用1日予算に達したため待機します。');
-  // 16回/日なら90分。10分トリガーが重なっても、手動実行でも短縮しない。
+  // 48回/日なら30分。10分トリガーが重なっても、手動実行でも短縮しない。
   const interval = Math.max(10, 1440 / config.geminiDailyBudget) * 60000;
   if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
     throw waitError_('Geminiの解析間隔を空けるため待機します。');
@@ -854,4 +858,13 @@ function processInstagram_(properties, state, image, config) {
     if (!published.id || !/^\d+$/.test(String(published.id))) throw new Error('Instagramの投稿成功応答が確認できません。');
     return String(published.id);
   });
+}
+
+/** 既存プロジェクトを30分運用へ変更。認証・投稿状態・使用済み予算は維持する。 */
+function configureThirtyMinuteYouTube() {
+  const properties = PropertiesService.getScriptProperties();
+  properties.setProperty('YOUTUBE_MIN_INTERVAL_MINUTES', '30');
+  properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '48');
+  properties.deleteProperty('MAX_IMAGE_AGE_MINUTES'); // 現在版では画像の古さを判定しない。
+  console.log('YouTube投稿を30分間隔、Gemini予算を48試行/日に設定しました。');
 }
