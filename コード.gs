@@ -12,8 +12,8 @@ const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
 
-function processLatestImageAndLog() {
-  return runBot_(false);
+function processLatestImageAndLog(event) {
+  return runBot_(false, Boolean(event && event.triggerUid));
 }
 
 /** Gemini推論と配信検出だけを行う。履歴の書き込み・外部への投稿はしない。 */
@@ -21,7 +21,7 @@ function previewLatestImage() {
   return runBot_(true);
 }
 
-function runBot_(forcePreview) {
+function runBot_(forcePreview, triggerDriven) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) {
     console.log('他の実行が処理中のためスキップしました。');
@@ -29,6 +29,8 @@ function runBot_(forcePreview) {
   }
   try {
     const config = getConfig_();
+    config.triggerDriven = Boolean(triggerDriven);
+    if (config.triggerDriven) config.youtubeMinMinutes = 1; // 投稿周期は時間主導トリガーが決める。連続実行だけ1分抑制。
     const file = findLatestImage_(config.folderId);
     if (!file) {
       console.log('PNG/JPEG画像が見つかりません。');
@@ -80,7 +82,7 @@ function runBot_(forcePreview) {
     if (state.youtube === 'sent') {
       const lastPost = state.youtubeSentAt === undefined ? getLimitState_().youtube.lastPost : state.youtubeSentAt;
       if (lastPost === undefined) state.youtubeSentAt = Date.now();
-      else if (Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
+      else if (config.triggerDriven || Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
     }
     if (!state.feeling) {
       state.feeling = previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
@@ -276,8 +278,9 @@ function reserveGeminiAttempt_(config) {
   checkCooldown_(row, 'Gemini');
   resetDailyCounter_(row);
   if ((row.count || 0) >= config.geminiDailyBudget) throw waitError_('GeminiのBOT用1日予算に達したため待機します。');
-  // 48回/日なら30分。10分トリガーが重なっても、手動実行でも短縮しない。
-  const interval = Math.max(10, 1440 / config.geminiDailyBudget) * 60000;
+  // 時間主導トリガーは選ばれた周期で解析する。日次予算は維持する。
+  // 手動実行は予算を均等配分し、連続実行はトリガーでも最短1分空ける。
+  const interval = (config.triggerDriven ? 1 : Math.max(10, 1440 / config.geminiDailyBudget)) * 60000;
   if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
     throw waitError_('Geminiの解析間隔を空けるため待機します。');
   }
@@ -397,6 +400,7 @@ function showBotUsage() {
     geminiDailyBudget: config.geminiDailyBudget,
     geminiMinMinutes: Math.max(10, 1440 / config.geminiDailyBudget),
     youtubeMinMinutes: config.youtubeMinMinutes,
+    youtubeAutomaticInterval: 'GASの時間主導トリガーで設定（手動実行はyoutubeMinMinutes）',
     youtubeDailyUnitBudget: config.youtubeDailyBudget,
     instagramEnabled: config.enableInstagram,
     instagramDailyBudget: config.instagramDailyBudget,
@@ -476,7 +480,7 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
     // 画像1枚・短文用。モデルを固定し、不要な思考と出力トークンを抑える。
     generationConfig: {
       temperature: 1, maxOutputTokens: 256,
-      thinkingConfig: { thinkingBudget: 0 },
+      thinkingConfig: { thinkingLevel: 'minimal' },
       mediaResolution: 'MEDIA_RESOLUTION_MEDIUM'
     }
   };
@@ -759,13 +763,18 @@ function safeError_(error) {
   return 'サービス呼び出しに失敗しました。認可・サービス設定・割当を確認してください。';
 }
 
-/** 同じ関数の重複トリガーだけを整理し、10分間隔を1つ作る。 */
-function installTenMinuteTrigger() {
+/** 初期トリガーを30分で作成。以後はGASのトリガー画面で間隔を変更する。 */
+function installThirtyMinuteTrigger() {
   const config = getConfig_();
   if (config.dryRun) throw new Error('プレビューを確認後、DRY_RUN=falseにしてからトリガーを作成してください。');
   removeBotTriggers();
-  ScriptApp.newTrigger(BOT_HANDLER).timeBased().everyMinutes(10).create();
-  console.log('10分間隔のトリガーを作成しました（実行時刻は厳密な10分刻みではありません）。');
+  ScriptApp.newTrigger(BOT_HANDLER).timeBased().everyMinutes(30).create();
+  console.log('初期30分のトリガーを作成しました。以後は時計マークのトリガー画面で間隔を変更できます。');
+}
+
+/** 旧版の操作名を使った場合も、新しい30分トリガーへ移行する。 */
+function installTenMinuteTrigger() {
+  return installThirtyMinuteTrigger();
 }
 
 function removeBotTriggers() {
@@ -866,5 +875,5 @@ function configureThirtyMinuteYouTube() {
   properties.setProperty('YOUTUBE_MIN_INTERVAL_MINUTES', '30');
   properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '48');
   properties.deleteProperty('MAX_IMAGE_AGE_MINUTES'); // 現在版では画像の古さを判定しない。
-  console.log('YouTube投稿を30分間隔、Gemini予算を48試行/日に設定しました。');
+  console.log('手動投稿の最短間隔30分、Gemini予算48試行/日に設定しました。自動投稿の間隔はトリガー画面で変更してください。');
 }

@@ -199,7 +199,7 @@ function harness(options = {}) {
       getProjectTriggers: () => [...triggers],
       deleteTrigger: (trigger) => triggers.splice(triggers.indexOf(trigger), 1),
       newTrigger(handler) {
-        return { timeBased() { return this; }, everyMinutes(minutes) { assert.equal(minutes, 10); return this; },
+        return { timeBased() { return this; }, everyMinutes(minutes) { assert.equal(minutes, 30); return this; },
           create() { triggers.push({ getHandlerFunction: () => handler }); } };
       }
     }
@@ -211,6 +211,7 @@ function harness(options = {}) {
     now: () => now,
     refreshImage: () => { files[0].record.updated = now - 1000; },
     run: () => context.processLatestImageAndLog(),
+    runTrigger: () => context.processLatestImageAndLog({ triggerUid: 'test-trigger' }),
     preview: () => context.previewLatestImage(),
     state: () => JSON.parse(values.YOSAN_STATE_V1),
     data: () => data };
@@ -569,7 +570,7 @@ test('同時実行をスキップする', () => {
   assert.equal(h.calls.releases, 0);
 });
 
-test('トリガー再作成は他のハンドラーを削除せず10分トリガーを1つにする', () => {
+test('トリガー再作成は他のハンドラーを削除せず初期30分トリガーを1つにする', () => {
   const h = harness({ triggers: ['otherHandler', 'processLatestImageAndLog', 'processLatestImageAndLog'] });
   h.context.installTenMinuteTrigger();
   h.context.installTenMinuteTrigger();
@@ -764,7 +765,7 @@ test('利用状況はキーを出さず、実レスポンスのトークン数�
   assert.ok(!JSON.stringify(report).includes('test-gemini-key'));
   const payload = JSON.parse(h.calls.gemini[0].request.payload);
   assert.equal(payload.generationConfig.maxOutputTokens, 256);
-  assert.equal(payload.generationConfig.thinkingConfig.thinkingBudget, 0);
+  assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
 });
 
 
@@ -1096,4 +1097,38 @@ test('30分設定の移行関数は認証・投稿済み状態・使用済み予
   assert.equal(h.values.GEMINI_API_KEY, 'test-gemini-key');
   assert.equal(h.values.YOSAN_STATE_V1, state);
   assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+});
+
+
+test('自動投稿は固定の手動間隔を使わずトリガーの5分周期に従う', () => {
+  const h = harness({ properties: { YOUTUBE_MIN_INTERVAL_MINUTES: '60', ENABLE_X: 'false' } });
+  h.runTrigger(); h.advance(5 * 60000); h.runTrigger(); h.advance(5 * 60000); h.runTrigger();
+  assert.equal(h.calls.chats.length, 3);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('新しい画像もトリガー周期で解析するがGeminiの日次予算は超えない', () => {
+  const h = harness({ properties: { GEMINI_DAILY_REQUEST_BUDGET: '2', ENABLE_X: 'false' } });
+  h.runTrigger(); h.advance(5 * 60000); h.refreshImage(); h.runTrigger();
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.chats.length, 2);
+  h.advance(5 * 60000); h.refreshImage();
+  assert.equal(h.runTrigger().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('トリガーの連続発火でも1分未満の重複投稿を抑える', () => {
+  const h = harness({ properties: { ENABLE_X: 'false' } });
+  h.runTrigger(); h.runTrigger();
+  assert.equal(h.calls.chats.length, 1);
+  h.advance(60000); h.runTrigger();
+  assert.equal(h.calls.chats.length, 2);
+});
+
+test('30分トリガーの作成・再作成で他のトリガーを維持する', () => {
+  const h = harness({ triggers: ['otherHandler', 'processLatestImageAndLog'] });
+  h.context.installThirtyMinuteTrigger();
+  h.context.installThirtyMinuteTrigger();
+  assert.deepEqual(h.triggers.map(x => x.getHandlerFunction()), ['otherHandler', 'processLatestImageAndLog']);
 });
