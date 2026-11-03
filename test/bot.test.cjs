@@ -1316,3 +1316,76 @@ test('学校側の処理は個人側の動画ID設定ミスにも依存しない
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.calls.gemini.length, 1);
 });
+
+
+test('個人側診断は投稿チャンネル・配信・準備状態を確認し投稿や状態変更はしない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school), before = h.values.YOSAN_STATE_V1;
+  const result = h.context.diagnosePersonalYouTube();
+  assert.equal(result.status, 'diagnosed');
+  assert.equal(result.channelAvailable, true);
+  assert.equal(result.liveChatAvailable, true);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.values.YOSAN_STATE_V1, before);
+  assert.equal(h.calls.releases, 1);
+});
+
+test('投稿用YouTubeチャンネルがない場合を診断できる', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false });
+  assert.equal(h.context.diagnosePersonalYouTube().channelAvailable, false);
+  assert.ok(h.calls.console.join('\n').includes('チャンネルが作成済みか'));
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('投稿失敗の段階と理由を保存し、unknownの状態は維持する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const failure = new Error('API call to youtube.liveChatMessages.insert failed with error: youtubeSignupRequired');
+  const h = personalWithPrepared(school, { chatFailure: failure });
+  const result = h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(result.stage, 'チャット投稿API');
+  assert.equal(result.code, 'youtubeSignupRequired');
+  assert.equal(h.state().youtube, 'unknown');
+  const diagnostic = JSON.parse(h.values.YOSAN_YOUTUBE_LAST_ERROR_V1);
+  assert.equal(diagnostic.code, 'youtubeSignupRequired');
+  h.context.diagnosePersonalYouTube();
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(h.calls.chats.length, 1);
+  assert.ok(h.calls.console.join('\n').includes('前回のエラー段階'));
+});
+
+test('資格情報・メール・URLをエラー表示から除外する', () => {
+  const h = harness();
+  const failure = new Error('API call to youtube.liveChatMessages.insert failed with error: forbidden ' +
+    'access_token=private-access client_secret=private-secret Bearer private-bearer ' +
+    'AIzaPrivateApiKey123456789 abc@example.com https://example.com/?token=private-url ' + 'a'.repeat(100));
+  const diagnostic = h.context.youtubeDiagnostic_(failure, 'チャット投稿API');
+  for (const secret of ['private-access', 'private-secret', 'private-bearer', 'AIzaPrivateApiKey', 'abc@example.com', 'private-url', 'a'.repeat(100)]) {
+    assert.ok(!diagnostic.detail.includes(secret), secret);
+  }
+  assert.equal(diagnostic.code, 'forbidden');
+  assert.ok(!h.context.youtubeDiagnostic_(new Error('timeout private-key'), '配信取得').detail.includes('private-key'));
+});
+
+test('解析データ破損とYouTubeサービス未追加を別の段階・理由で診断する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const corrupt = personalWithPrepared(school, { properties: { YOSAN_STATE_V1: 'broken' } });
+  const state = corrupt.context.postPreparedCommentToYouTube();
+  assert.equal(state.stage, '解析済みデータの読込');
+  assert.equal(state.code, 'BOT_STATE_INVALID');
+  const missing = personalWithPrepared(school); delete missing.context.YouTube;
+  const result = missing.context.diagnosePersonalYouTube();
+  assert.equal(result.stage, '投稿用チャンネルの取得');
+  assert.equal(result.code, 'YOUTUBE_SERVICE_MISSING');
+});
+
+test('個人側診断もスクリプトロックとAPI予算を守る', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const busy = personalWithPrepared(school, { busy: true });
+  assert.equal(busy.context.diagnosePersonalYouTube().status, 'busy');
+  assert.equal(busy.calls.channels, 0);
+  const limited = personalWithPrepared(school, { properties: { YOUTUBE_DAILY_UNIT_BUDGET: '1' } });
+  const result = limited.context.diagnosePersonalYouTube();
+  assert.equal(result.code, 'BOT_WAIT');
+  assert.equal(limited.calls.chats.length, 0);
+});

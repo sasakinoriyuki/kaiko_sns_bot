@@ -7,6 +7,7 @@ const BOT_STATE_KEY = 'YOSAN_STATE_V1';
 const BOT_HANDLER = 'processLatestImageAndLog';
 const BOT_LIMITS_KEY = 'YOSAN_LIMITS_V1';
 const BOT_PREVIEW_KEY = 'YOSAN_PREVIEW_V1';
+const BOT_YOUTUBE_ERROR_KEY = 'YOSAN_YOUTUBE_LAST_ERROR_V1';
 const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -963,9 +964,11 @@ function postPreparedCommentToYouTube(event) {
   requireBotScopes_('youtube', false);
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return { status: 'busy' };
+  let stage = '設定の読込';
   try {
     const config = getYouTubeOnlyConfig_(event);
     const properties = PropertiesService.getScriptProperties();
+    stage = '解析済みデータの読込';
     const state = readJsonProperty_(properties, BOT_STATE_KEY);
     if (!state || !state.logged || typeof state.feeling !== 'string' || !state.feeling.trim()) {
       console.log('学校側の解析・履歴保存を待っています。先にanalyzeLatestImageAndLogを実行してください。');
@@ -997,20 +1000,25 @@ function postPreparedCommentToYouTube(event) {
     }
     if (state.youtube === undefined) state.youtube = 'pending';
     if (state.youtube !== 'pending') throw new Error('YouTubeの保存状態を確認してください。');
+    stage = '配信チャットの取得';
     const live = findActiveLive_(config);
     if (!live || !live.liveChatId) {
       console.log('個人側でライブチャットが見つかりません。動画ID・配信中・チャット有効を確認してください。');
       return { status: 'no_live', youtube: 'pending' };
     }
+    stage = '送信前の状態保存';
     sendWithState_(properties, state, 'youtube', function () {
+      stage = 'チャット投稿API';
       const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
       state.youtubeSentAt = Date.now();
+      stage = '投稿結果の保存';
       return id;
     });
     return { status: 'processed', youtube: state.youtube };
   } catch (error) {
-    console.error('個人側YouTube処理: ' + safeError_(error));
-    return { status: error.botWait ? 'rate_limited' : 'error' };
+    const diagnostic = rememberYouTubeDiagnostic_(error, stage);
+    console.error('個人側YouTube処理 [' + diagnostic.stage + ' / ' + diagnostic.code + ']: ' + diagnostic.detail);
+    return { status: error.botWait ? 'rate_limited' : 'error', stage: stage, code: diagnostic.code };
   } finally {
     lock.releaseLock();
   }
@@ -1030,4 +1038,94 @@ function installPersonalYouTubeTrigger() {
   removeBotTriggers();
   ScriptApp.newTrigger('postPreparedCommentToYouTube').timeBased().everyMinutes(30).create();
   console.log('個人側の投稿トリガーを30分で作成しました。間隔はトリガー画面で変更できます。');
+}
+
+
+/** APIの生レスポンスや資格情報を出さず、理由・段階だけを表示する。 */
+function youtubeDiagnostic_(error, stage) {
+  const message = String(error && error.message || '');
+  let details = '';
+  try { details = JSON.stringify(error && error.details || {}); } catch (ignored) {}
+  const combined = message + ' ' + details;
+  const reasons = [
+    'youtubeSignupRequired', 'authenticatedUserNotChannel', 'insufficientPermissions',
+    'accessNotConfigured', 'SERVICE_DISABLED', 'PERMISSION_DENIED', 'UNAUTHENTICATED',
+    'authorizationRequired', 'accountDelegationForbidden', 'authenticatedUserAccountClosed',
+    'authenticatedUserAccountSuspended', 'channelSuspended', 'liveChatDisabled',
+    'liveChatEnded', 'liveChatNotFound', 'messageTextInvalid', 'messageTextRequired',
+    'liveChatIdRequired', 'quotaExceeded', 'dailyLimitExceeded', 'rateLimitExceeded', 'forbidden'
+  ];
+  let code = reasons.find(function (name) {
+    return new RegExp('\\b' + name + '\\b', 'i').test(combined);
+  }) || (error && error.botWait ? 'BOT_WAIT' : 'UNCLASSIFIED');
+  if (/\bYouTube\b.*(?:is not defined|undefined)|Cannot read properties.*(?:LiveChatMessages|insert)/i.test(message)) code = 'YOUTUBE_SERVICE_MISSING';
+  if (/^(?:BOTの保存状態|YouTubeの保存状態)/.test(message)) code = 'BOT_STATE_INVALID';
+  if (/^(?:YOUTUBE_|LIVE_SEARCH_)/.test(message)) code = 'CONFIG_INVALID';
+  let detail = '理由を特定できませんでした。実行段階と診断結果を確認してください。';
+  if (code !== 'UNCLASSIFIED' || /\bAPI call to youtube\./i.test(message) ||
+      /^(?:YOUTUBE_|LIVE_SEARCH_|BOTの保存状態|YouTubeの保存状態|Cannot read properties|.+ is not a function)/.test(message)) {
+    detail = message
+      .replace(/\bBearer\s+[^\s"'<>]+/gi, 'Bearer [TOKEN]')
+      .replace(/\bAIza[A-Za-z0-9_-]+\b/g, '[API_KEY]')
+      .replace(/((?:access_token|refresh_token|client_secret|api[_ -]?key|authorization)\s*["']?\s*[:=]\s*["']?)[^"'&,\s}]+/gi, '$1[SECRET]')
+      .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL]')
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[EMAIL]')
+      .replace(/[A-Za-z0-9+/_=-]{80,}/g, '[LONG_VALUE]')
+      .replace(/[\r\n\t]+/g, ' ').slice(0, 500);
+    if (!detail.trim()) detail = code;
+  }
+  return { stage: stage, code: code, detail: detail };
+}
+
+function rememberYouTubeDiagnostic_(error, stage) {
+  const diagnostic = youtubeDiagnostic_(error, stage);
+  try {
+    PropertiesService.getScriptProperties().setProperty(BOT_YOUTUBE_ERROR_KEY,
+      JSON.stringify({ stage: diagnostic.stage, code: diagnostic.code, detail: diagnostic.detail, at: Date.now() }));
+  } catch (ignored) {}
+  return diagnostic;
+}
+
+/** 個人側の読み取り専用診断。投稿・投稿状態のリセットは行わない。 */
+function diagnosePersonalYouTube() {
+  requireBotScopes_('youtube', false);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return { status: 'busy' };
+  let stage = '設定の読込';
+  try {
+    const config = getYouTubeOnlyConfig_();
+    const properties = PropertiesService.getScriptProperties();
+    stage = '解析済みデータの読込';
+    const state = readJsonProperty_(properties, BOT_STATE_KEY);
+    const status = state && ['pending', 'sending', 'sent', 'unknown'].indexOf(state.youtube) !== -1 ? state.youtube : '未準備';
+    console.log('解析データ: ' + (state && state.logged && state.feeling ? '準備済み' : '学校側で解析が必要'));
+    console.log('投稿状態: ' + status);
+    stage = '投稿用チャンネルの取得';
+    const channels = youtubeCall_(config, 1, function () {
+      return YouTube.Channels.list('id', { mine: true, maxResults: 50 });
+    });
+    const channelAvailable = Boolean(channels.items && channels.items.length);
+    console.log('投稿用チャンネル: ' + (channelAvailable ? '取得済み' :
+      '見つかりません。個人アカウントでYouTubeにログインし、チャンネルが作成済みか確認してください。'));
+    stage = '配信チャットの取得';
+    const live = findActiveLive_(config);
+    console.log('配信チャット: ' + (live && live.liveChatId ? '取得済み' : '見つかりません'));
+    const previous = readJsonProperty_(properties, BOT_YOUTUBE_ERROR_KEY);
+    if (previous && previous.stage && previous.code) {
+      console.log('前回のエラー段階: ' + previous.stage + ' / 理由: ' + previous.code);
+    } else {
+      console.log('前回の詳しいエラー記録: ありません（旧版では保存していません）');
+    }
+    if (status === 'unknown' || status === 'sending') {
+      console.log('前回の投稿結果は不明です。実際のチャットを確認するまで再送しないでください。');
+    }
+    return { status: 'diagnosed', channelAvailable: channelAvailable,
+      liveChatAvailable: Boolean(live && live.liveChatId), youtubeState: status };
+  } catch (error) {
+    const diagnostic = rememberYouTubeDiagnostic_(error, stage);
+    console.error('個人側YouTube診断 [' + diagnostic.stage + ' / ' + diagnostic.code + ']: ' + diagnostic.detail);
+    return { status: 'error', stage: diagnostic.stage, code: diagnostic.code };
+  } finally {
+    lock.releaseLock();
+  }
 }

@@ -145,6 +145,6 @@ npm test
 
 GAS・Gemini・YouTube・X・Instagramのサービスをモックし、本体をNodeのVMで実行します。重複防止、上書き画像、古い画像、API失敗、部分成功、状態保存失敗、履歴保存直後の中断、配信の切り替え、プレビュー、トリガー管理などを検証します。外部への投稿や実際の秘密鍵は使用しません。GAS上の認可、Drive/Sheetsへの実アクセス、モデルの利用可否、実際の投稿は、このローカルテストでは検証していません。
 
-古い画像の処理・同じ画像の30分投稿を含む合計100件はV8上のNode API互換実行で通過しました。クラウド環境の起動失敗により `npm test` は未実行です。実アカウントへの投稿は行っていません。
+古い画像の処理・同じ画像の30分投稿を含む合計106件はV8上のNode API互換実行で通過しました。クラウド環境の起動失敗により `npm test` は未実行です。実アカウントへの投稿は行っていません。
 
 参考: [Google Gen AI公式SDK](https://github.com/googleapis/js-genai)、[OAuth1公式ライブラリ](https://github.com/googleworkspace/apps-script-oauth1)、[YouTubeライブAPI](https://developers.google.com/youtube/v3/live/docs)、[X画像アップロードAPI](https://developer.x.com/en/docs/x-api/v1/media/upload-media/api-reference/post-media-upload)。
