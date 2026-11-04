@@ -20,7 +20,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
   let now = options.now ?? Date.now();
-  const calls = { gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
+  const calls = { triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
@@ -204,7 +204,7 @@ function harness(options = {}) {
       getProjectTriggers: () => [...triggers],
       deleteTrigger: (trigger) => triggers.splice(triggers.indexOf(trigger), 1),
       newTrigger(handler) {
-        return { timeBased() { return this; }, everyMinutes(minutes) { assert.equal(minutes, 30); return this; },
+        return { timeBased() { return this; }, everyMinutes(minutes) { assert.equal(minutes, 30); calls.triggerIntervals.push({ handler, minutes }); return this; }, everyHours(hours) { assert.equal(hours, 1); calls.triggerIntervals.push({ handler, hours }); return this; },
           create() { triggers.push({ getHandlerFunction: () => handler }); } };
       }
     }
@@ -1388,4 +1388,188 @@ test('個人側診断もスクリプトロックとAPI予算を守る', () => {
   const result = limited.context.diagnosePersonalYouTube();
   assert.equal(result.code, 'BOT_WAIT');
   assert.equal(limited.calls.chats.length, 0);
+});
+
+const VARIATION_PROPERTIES = { ENABLE_FEELING_VARIATION: 'true', GEMINI_DAILY_REQUEST_BUDGET: '24', YOUTUBE_MIN_INTERVAL_MINUTES: '60' };
+
+test('1時間移行は認証情報・投稿状態・消費済み割当を維持する', () => {
+  const h = preparedSchool();
+  h.context.analyzeLatestImageAndLog();
+  const before = { state: h.values.YOSAN_STATE_V1, limits: h.values.YOSAN_LIMITS_V1, key: h.values.GEMINI_API_KEY };
+  h.context.configureHourlyCommentary();
+  assert.equal(h.values.ENABLE_FEELING_VARIATION, 'true');
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '24');
+  assert.equal(h.values.YOUTUBE_MIN_INTERVAL_MINUTES, '60');
+  assert.equal(h.values.YOSAN_STATE_V1, before.state);
+  assert.equal(h.values.YOSAN_LIMITS_V1, before.limits);
+  assert.equal(h.values.GEMINI_API_KEY, before.key);
+});
+
+test('学校と個人の自動実行はそれぞれ1時間で作成する', () => {
+  const school = preparedSchool({ allowedScopes: [...SCHOOL_SCOPES, 'https://www.googleapis.com/auth/script.scriptapp'] });
+  school.context.installSchoolAnalysisTrigger();
+  assert.deepEqual(school.calls.triggerIntervals, [{ handler: 'analyzeLatestImageAndLog', hours: 1 }]);
+  const personal = personalWithPrepared(school, { allowedScopes: [...PERSONAL_SCOPES, 'https://www.googleapis.com/auth/script.scriptapp'] });
+  personal.context.installPersonalYouTubeTrigger();
+  assert.deepEqual(personal.calls.triggerIntervals, [{ handler: 'postPreparedCommentToYouTube', hours: 1 }]);
+});
+
+test('同じ写真でも1時間後に新しい実況を解析・記録して個人側から1回だけ投稿する', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES, geminiResponses: [
+    geminiResponse('白い体が並んで、今日はここが特等席。'),
+    geminiResponse('この葉っぱの模様、みんなには何に見える？')
+  ] });
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
+  const first = school.state();
+  const personal = personalWithPrepared(school);
+  assert.equal(personal.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  assert.equal(personal.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'waiting_fresh_analysis');
+  Object.assign(school.values, { YOSAN_STATE_V1: personal.values.YOSAN_STATE_V1, YOSAN_LIMITS_V1: personal.values.YOSAN_LIMITS_V1 });
+  school.advance(3600000);
+  assert.equal(school.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'prepared');
+  const second = school.state();
+  assert.equal(second.key, first.key);
+  assert.ok(second.analysisKey !== first.analysisKey);
+  assert.ok(second.feeling !== first.feeling);
+  assert.equal(school.calls.gemini.length, 2);
+  assert.equal(school.calls.logs.length, 2);
+  assert.ok(school.calls.logs[0][3] !== school.calls.logs[1][3]);
+  assert.ok(school.calls.logs[0][0] !== school.calls.logs[1][0]);
+  const payload = JSON.parse(school.calls.gemini[1].request.payload);
+  assert.ok(payload.contents[0].parts[0].text.includes(first.feeling));
+  assert.ok(payload.contents[0].parts[0].text.includes('問いかけ') || payload.contents[0].parts[0].text.includes('ユーモア'));
+  personal.advance(3600000);
+  Object.assign(personal.values, { YOSAN_STATE_V1: school.values.YOSAN_STATE_V1, YOSAN_LIMITS_V1: school.values.YOSAN_LIMITS_V1 });
+  assert.equal(personal.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  personal.advance(3600000);
+  assert.equal(personal.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'waiting_fresh_analysis');
+  assert.equal(personal.calls.chats.length, 2);
+  assert.ok(personal.calls.chats[0].payload.snippet.textMessageDetails.messageText !== personal.calls.chats[1].payload.snippet.textMessageDetails.messageText);
+  assert.equal(personal.calls.gemini.length, 0);
+  assert.equal(personal.calls.logs.length, 0);
+});
+
+test('完全一致・ほぼ同じ語句の実況は追加API呼出しなしで見送る', () => {
+  const original = '白い体が並んで、今日はここが特等席。';
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES, geminiResponses: [
+    geminiResponse(original), geminiResponse(original + '！'), geminiResponse('白い体が並んで、今日はここも特等席。')
+  ] });
+  school.context.analyzeLatestImageAndLog();
+  const state = school.values.YOSAN_STATE_V1;
+  for (let i = 0; i < 2; i++) {
+    school.advance(3600000);
+    assert.equal(school.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'duplicate_comment');
+    assert.equal(school.values.YOSAN_STATE_V1, state);
+    assert.equal(school.calls.gemini.length, i + 2);
+  }
+  assert.equal(school.calls.logs.length, 1);
+});
+
+test('実況履歴は直近8件を保持し比較時は表記・記号を正規化する', () => {
+  const h = preparedSchool({ properties: VARIATION_PROPERTIES });
+  let history = [];
+  for (let i = 0; i < 12; i++) {
+    h.context.rememberFeeling_('実況' + i, history);
+    history = JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts;
+  }
+  assert.equal(history.length, 8);
+  assert.equal(history[0], '実況4');
+  assert.ok(h.context.similarFeelings_('ＡＢＣ ほっと一息。💭', 'abcほっと一息！'));
+  assert.equal(h.context.similarFeelings_('みんな集合', '葉っぱの模様'), false);
+});
+
+test('既存の解析文と最後の投稿文も初回の比較履歴に含める', () => {
+  const h = preparedSchool();
+  h.context.analyzeLatestImageAndLog();
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1);
+  limits.youtube.lastText = '配信を見守ってくれてありがとう。';
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  const history = h.context.recentFeelings_();
+  assert.ok(history.includes(h.state().feeling));
+  assert.ok(history.includes(limits.youtube.lastText));
+});
+
+test('履歴破損はAPIを呼ばず停止し履歴を削除しない', () => {
+  const school = preparedSchool({ properties: { ...VARIATION_PROPERTIES, YOSAN_FEELING_HISTORY_V1: '{"texts":[123]}' } });
+  assert.throws(() => school.context.analyzeLatestImageAndLog(), /実況文の履歴/);
+  assert.equal(school.calls.gemini.length, 0);
+  assert.equal(school.values.YOSAN_FEELING_HISTORY_V1, '{"texts":[123]}');
+});
+
+test('学校の記録失敗時は生成済み実況を使い再解析せず履歴を完了する', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES, logFailures: 1 });
+  assert.throws(() => school.context.analyzeLatestImageAndLog(), /sheet write failure/);
+  const feeling = school.state().feeling;
+  school.advance(3600000);
+  assert.equal(school.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'prepared');
+  assert.equal(school.calls.gemini.length, 1);
+  assert.equal(school.state().feeling, feeling);
+  assert.equal(school.calls.logs.length, 1);
+});
+
+test('変化モードでも解析プレビューから初回の本番解析を再利用する', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES });
+  school.context.previewSchoolAnalysis();
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(school.calls.gemini.length, 1);
+  assert.equal(school.calls.logs.length, 1);
+});
+
+test('投稿結果不明は写真が変わっても学校側の解析で解除しない', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const state = school.state(); state.youtube = 'unknown';
+  school.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  school.advance(3600000); school.refreshImage();
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'unknown');
+  assert.equal(school.calls.gemini.length, 1);
+  assert.equal(school.state().youtube, 'unknown');
+  assert.equal(school.run().status, 'unknown');
+});
+
+test('新しい画像でも最後の投稿と似た準備済み文は個人側で投稿しない', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const personal = personalWithPrepared(school);
+  assert.equal(personal.context.postPreparedCommentToYouTube().youtube, 'sent');
+  const state = personal.state(); state.youtube = 'pending'; state.key = 'new-photo';
+  state.feeling += '！'; personal.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  personal.advance(3600000);
+  assert.equal(personal.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'waiting_fresh_analysis');
+  assert.equal(personal.calls.chats.length, 1);
+});
+
+test('新しい実況でも手動投稿は60分間隔を守る', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const personal = personalWithPrepared(school);
+  assert.equal(personal.context.postPreparedCommentToYouTube().youtube, 'sent');
+  const state = personal.state(); state.youtube = 'pending'; state.feeling = 'この場所からみんなの配信を見守っているよ。';
+  personal.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  personal.advance(59 * 60000);
+  assert.equal(personal.context.postPreparedCommentToYouTube().status, 'rate_limited');
+  assert.equal(personal.calls.chats.length, 1);
+  personal.advance(60000);
+  assert.equal(personal.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(personal.calls.chats.length, 2);
+});
+
+test('生成を更新しても1日予算に達したら解析と再投稿を増やさない', () => {
+  const school = preparedSchool({ properties: { ...VARIATION_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '1' } });
+  school.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  school.advance(60000);
+  assert.equal(school.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'rate_limited');
+  assert.equal(school.calls.gemini.length, 1);
+  assert.equal(school.calls.logs.length, 1);
+});
+
+test('YouTube応答後に最後の投稿文を保存できなければunknownとして再送を止める', () => {
+  const school = preparedSchool({ properties: VARIATION_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const personal = personalWithPrepared(school, { failPropertyWrite: (name, value) => name === 'YOSAN_LIMITS_V1' && value.includes('"lastText"') });
+  assert.equal(personal.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(personal.state().youtube, 'unknown');
+  personal.advance(3600000);
+  assert.equal(personal.context.postPreparedCommentToYouTube().status, 'unknown');
+  assert.equal(personal.calls.chats.length, 1);
 });
