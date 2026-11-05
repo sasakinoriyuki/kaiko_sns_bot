@@ -14,6 +14,7 @@ const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
+const REARING_ANALYSIS_VERSION = 'rearing-v1';
 const DEFAULT_SILKWORM_NAMES = [
   "こはく",
   "まゆ",
@@ -113,10 +114,15 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
 
     const properties = PropertiesService.getScriptProperties();
     const preview = readJsonProperty_(properties, BOT_PREVIEW_KEY);
-    const previewFeeling = preview && preview.key === image.key && preview.model === config.geminiModel ? preview.feeling : null;
+    const previewCompatible = preview && (!config.enableRearingContext ||
+      preview.analysisVersion === REARING_ANALYSIS_VERSION && preview.rearing);
+    const previewFeeling = previewCompatible && preview.key === image.key && preview.model === config.geminiModel ? preview.feeling : null;
+    if (previewFeeling && config.enableRearingContext) config.rearingObservation = preview.rearing;
     if (forcePreview || config.dryRun) {
       const feeling = previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
-      properties.setProperty(BOT_PREVIEW_KEY, JSON.stringify({ key: image.key, model: config.geminiModel, feeling: feeling }));
+      properties.setProperty(BOT_PREVIEW_KEY, JSON.stringify({ key: image.key, model: config.geminiModel, feeling: feeling,
+        analysisVersion: config.enableRearingContext ? REARING_ANALYSIS_VERSION : null,
+        rearing: config.rearingObservation || null }));
       const live = analysisOnly ? null : findActiveLive_(config);
       console.log('プレビュー（投稿・履歴保存なし）: ' + feeling);
       console.log(analysisOnly ? '学校側の解析プレビューです。YouTubeにはアクセスしません。' : live && live.liveChatId ? '配信中のチャットを検出しました。' : '投稿可能なライブチャットはありません。');
@@ -125,7 +131,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
 
     let state = readJsonProperty_(properties, BOT_STATE_KEY);
     if (!state || state.key !== image.key) {
-      const blocked = (config.varyFeelings || config.enableNamedComments) && state && ['sending', 'unknown'].indexOf(state.youtube) !== -1;
+      const blocked = (config.varyFeelings || config.enableNamedComments || config.enableRearingContext) && state && ['sending', 'unknown'].indexOf(state.youtube) !== -1;
       if (blocked) state.youtube = 'unknown';
       else state = { key: image.key, feeling: null, logged: false, youtube: 'pending', x: 'pending', instagram: 'pending' };
     }
@@ -143,16 +149,21 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
       else if (config.triggerDriven || Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
     }
     const refreshRequested = config.varyFeelings && Boolean(refreshFeeling || triggerDriven);
-    if ((config.varyFeelings || config.enableNamedComments) && state.youtube === 'unknown') {
+    if ((config.varyFeelings || config.enableNamedComments || config.enableRearingContext) && state.youtube === 'unknown') {
       saveState_(properties, state);
       console.log('前回の投稿結果が不明なため、実況文の更新も確認まで待機します。');
       return { status: 'unknown', youtube: 'unknown' };
     }
     const regenerate = refreshRequested && state.feeling && state.logged;
-    if (!state.feeling || regenerate) {
+    const needsRearingUpdate = config.enableRearingContext && state.analysisVersion !== REARING_ANALYSIS_VERSION;
+    if (!state.feeling || regenerate || needsRearingUpdate) {
       state.feeling = regenerate ? analyzeImageWithGemini(image.base64, image.mimeType, config) :
         previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
-      if (config.varyFeelings) {
+      if (config.enableRearingContext) {
+        state.rearing = config.rearingObservation;
+        state.analysisVersion = REARING_ANALYSIS_VERSION;
+      }
+      if (config.varyFeelings || config.enableRearingContext) {
         state.generatedAt = Date.now();
         state.analysisKey = image.key + ':feeling:' + state.generatedAt;
         state.youtube = 'pending';
@@ -238,6 +249,7 @@ function getConfig_(analysisOnly) {
     dryRun: booleanProperty_(values, 'DRY_RUN', true),
     splitAccounts: booleanProperty_(values, 'SPLIT_ACCOUNT_MODE', false),
     varyFeelings: booleanProperty_(values, 'ENABLE_FEELING_VARIATION', false),
+    enableRearingContext: booleanProperty_(values, 'ENABLE_REARING_CONTEXT', true),
     videoId: analysisOnly ? null : optionalYouTubeVideoId_(values),
     enableX: booleanProperty_(values, 'ENABLE_X', false),
     enableInstagram: booleanProperty_(values, 'ENABLE_INSTAGRAM', false),
@@ -578,6 +590,26 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
       mediaResolution: 'MEDIA_RESOLUTION_MEDIUM'
     }
   };
+  if (config.enableRearingContext) {
+    payload.systemInstruction.parts[0].text = payload.systemInstruction.parts[0].text
+      .replace('日本語の一言を70文字以内で返してください。', 'JSONのfeeling欄に日本語の一言を70文字以内で入れてください。')
+      .replace('引用符・見出し・ハッシュタグを付けないでください。', 'feeling本文に引用符・見出し・ハッシュタグを付けないでください。');
+    payload.systemInstruction.parts[0].text += rearingPrompt_();
+    payload.contents[0].parts[0].text += ' 出力は指定のJSONのみ。UI表示は転記欄、気持ち本文はfeeling欄に入れる。';
+    payload.generationConfig.maxOutputTokens = 512;
+    payload.generationConfig.responseMimeType = 'application/json';
+    payload.generationConfig.responseJsonSchema = {
+      type: 'object',
+      properties: {
+        stageText: { type: ['string', 'null'] },
+        temperatureText: { type: ['string', 'null'] },
+        humidityText: { type: ['string', 'null'] },
+        feeling: { type: 'string' }
+      },
+      required: ['stageText', 'temperatureText', 'humidityText', 'feeling'],
+      additionalProperties: false
+    };
+  }
   reserveGeminiAttempt_(config); // プレビュー・失敗・手動実行も回数に含める。
   let response;
   try {
@@ -616,7 +648,16 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
   const text = (parts || []).filter(function (part) { return !part.thought && typeof part.text === 'string'; })
     .map(function (part) { return part.text; }).join('').replace(/\s+/g, ' ').trim();
   if (!text) throw new Error('Geminiの回答が空です。');
-  const feeling = shortenText_(text, MAX_FEELING_CHARS);
+  let feeling;
+  if (config.enableRearingContext) {
+    const result = parseRearingResponse_(text);
+    config.rearingObservation = result.observation;
+    console.log('画像UIの読取り: ' + JSON.stringify(result.observation));
+    validateRearingFeeling_(result.feeling, result.observation);
+    feeling = shortenText_(result.feeling, MAX_FEELING_CHARS);
+  } else {
+    feeling = shortenText_(text, MAX_FEELING_CHARS);
+  }
   if (config.varyFeelings) {
     if (history.some(function (previous) { return similarFeelings_(feeling, previous); })) {
       const error = waitError_('直近と似た実況文が生成されたため、投稿を増やさず次の解析を待ちます。');
@@ -1034,7 +1075,7 @@ function getYouTubeOnlyConfig_(event) {
   const values = {};
   ['DRY_RUN', 'CHANNEL_ID', 'YOUTUBE_VIDEO_ID', 'LIVE_SEARCH_INTERVAL_MINUTES',
     'YOUTUBE_DAILY_UNIT_BUDGET', 'YOUTUBE_MIN_INTERVAL_MINUTES', 'ENABLE_FEELING_VARIATION',
-    'ENABLE_NAMED_COMMENTS', 'SILKWORM_NAMES'].forEach(function (name) {
+    'ENABLE_NAMED_COMMENTS', 'SILKWORM_NAMES', 'ENABLE_REARING_CONTEXT'].forEach(function (name) {
     const value = properties.getProperty(name);
     if (value !== null) values[name] = value;
   });
@@ -1046,6 +1087,7 @@ function getYouTubeOnlyConfig_(event) {
     youtubeDailyBudget: integerBudgetProperty_(values, 'YOUTUBE_DAILY_UNIT_BUDGET', 8000),
     youtubeMinMinutes: positiveNumberProperty_(values, 'YOUTUBE_MIN_INTERVAL_MINUTES', 30),
     varyFeelings: booleanProperty_(values, 'ENABLE_FEELING_VARIATION', false),
+    enableRearingContext: booleanProperty_(values, 'ENABLE_REARING_CONTEXT', true),
     triggerDriven: Boolean(event && event.triggerUid)
   };
   Object.assign(config, namedCommentConfig_(values));
@@ -1089,6 +1131,10 @@ function postPreparedCommentToYouTube(event) {
     if (state.youtube === 'unknown') {
       console.log('前回の投稿結果が不明です。実際のチャットを確認してください。自動再送はしません。');
       return { status: 'unknown', youtube: 'unknown' };
+    }
+    if (config.enableRearingContext && state.analysisVersion !== REARING_ANALYSIS_VERSION) {
+      console.log('学校側で飼育目安に対応した新しい解析を待っています。analyzeLatestImageAndLogを実行してください。');
+      return { status: 'waiting_analysis' };
     }
     if (config.varyFeelings && (state.youtube === 'sent' || youtubeTextWasRecentlyPosted_(state.feeling))) {
       console.log('新しい実況文を待っています。学校側でanalyzeLatestImageAndLogを実行してください。');
@@ -1289,11 +1335,17 @@ function recentFeelings_() {
 function variedFeelingPrompt_(history) {
   const viewpoints = [
     '見える蚕の姿勢や配置から、落ち着いた独り言。',
-    '見える葉や飼育場所から、控えめなユーモアのある一言。',
-    '見える群れの配置から、短い問いかけ。',
+    '見える飼育場所や並びから、控えめなユーモアのある一言。',
+    '見えるものを一つ選び、短い問いかけ。',
     '見える体の形や模様から、少し詩的だが大げさでない一言。',
-    '見える部分を一つ選び、配信を見ている人への短い呼びかけ。',
-    '画像から分かることを一つ選び、擬音を使わず軽快な一言。'
+    '配信を見ている人へ、写真に合った短い呼びかけ。',
+    '写真UIに眠・脱皮が明示されていれば静かに備える気持ち。それ以外は見える姿勢の独り言。',
+    '見える仲間との距離や配置から、仲間を意識した一言。実際の会話や移動は作らない。',
+    '見える場所の特徴から、居場所への小さなこだわりを想像した一言。',
+    'UIに読める令・日目があればそれを踏まえ、マイペースに過ごす気持ち。成長した事実は作らない。',
+    '食事以外の見える点を一つ選び、擬音を使わず軽快な一言。',
+    '餌が見える場合は食事への楽しみを控えめに。眠の最中なら食べている描写を避ける。',
+    '一つの見える特徴から、短く素朴な本音。温湿度への不満や定番の食事表現に頼らない。'
   ];
   const count = getLimitState_().gemini.count || 0;
   return '写真に写っている蚕の気持ちを想像した、新しい日本語の一言を70文字以内で1つだけ。' +
@@ -1316,7 +1368,7 @@ function youtubeTextWasRecentlyPosted_(feeling) {
 }
 
 
-/** 名前は画像の個体識別ではなく、実況の語り手を順番に選ぶ。 */
+/** 名前は画像の個体識別ではなく、実況用のニックネームを順番に選ぶ。 */
 function namedCommentConfig_(values) {
   const enabled = booleanProperty_(values, 'ENABLE_NAMED_COMMENTS', false);
   return { enableNamedComments: enabled,
@@ -1347,7 +1399,7 @@ function buildYouTubeComment_(feeling, config) {
   const name = config.silkwormNames[sequence % config.silkwormNames.length];
   const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
   return { name: name, date: date, sequence: sequence,
-    text: date + '｜語り手：' + name + '\n' + feeling };
+    text: date + '\n' + name + '：' + feeling };
 }
 
 function prepareYouTubeComment_(state, config) {
@@ -1378,6 +1430,10 @@ function previewPreparedComment() {
       console.log('学校側でanalyzeLatestImageAndLogを実行し、解析・記録を完了してください。');
       return { status: 'waiting_analysis' };
     }
+    if (config.enableRearingContext && state.analysisVersion !== REARING_ANALYSIS_VERSION) {
+      console.log('学校側でanalyzeLatestImageAndLogを実行し、飼育目安に対応した解析を完了してください。');
+      return { status: 'waiting_analysis' };
+    }
     const comment = buildYouTubeComment_(state.feeling, config);
     console.log('投稿文の確認（投稿なし）:\n' + comment.text);
     return { status: 'preview', messageText: comment.text,
@@ -1385,4 +1441,122 @@ function previewPreparedComment() {
   } finally {
     lock.releaseLock();
   }
+}
+
+
+/** ユーザー提供の飼育資料を、実況文の判断用の目安として使う。 */
+function rearingPrompt_() {
+  return '\n必ず先に画像UIの令・日目、温度、湿度を読み、JSONのstageText/temperatureText/humidityTextに見えた表示を転記する。' +
+    '各表示が読めない場合はnull。温湿度は現在の測定値を転記し、設定値や目安値と混同しない。stageTextは日数・成長段階の表示だけで、温湿度や推測を混ぜない。' +
+    '1令3日目と孵化後3日目を区別する。日数は飼育環境で変わるので、総日数や体長だけから令を確定しない。' +
+    '飼育目安:1令29℃、2令28℃、3令27℃、4令26℃、5令25℃。1〜3令の適温の目安は27〜29℃。' +
+    '湿度は1〜3令・5令が75%の目安。4令の湿度範囲はこの資料から断定しない。営繭中は23℃・60%の目安。' +
+    '湿度の許容範囲は資料にない。目安との差だけで湿っぽい・ジメジメ・ムシムシ・蒸れる・空気が乾いてつらいと言わない。' +
+    '通常の適温付近では暑い・寒い・冷え等の語を否定表現も含めて避け、別の話題を選ぶ。資料にある明確な低温は18℃以下、高温の危険域は34℃以上。' +
+    '危険域を快適・ちょうどよいと表現しない。眠や脱皮中に動かないことは病気と決めつけず、食べている描写をしない。' +
+    '気持ちは写真で見える特徴をもとに擬人化し、食事や温湿度ばかりにせず、配置・仲間・居場所・独り言・問いかけなどを変える。' +
+    'feelingは挨拶・自己紹介・名前・日付なしの日本語本文だけ、70文字以内。飼育の操作指示や健康診断は書かない。';
+}
+
+function readUiNumber_(text, kind) {
+  if (text === null) return null;
+  const normalized = text.normalize('NFKC').replace(/\s+/g, '');
+  const pattern = kind === 'temperature'
+    ? /^(?:(?:温度|気温|室温|温|Temperature|Temp\.?)[:：]?)?([+-]?\d+(?:\.\d+)?)(?:°C|度|C)?$/i
+    : /^(?:(?:湿度|湿|Humidity|Hum\.?)[:：]?)?(\d+(?:\.\d+)?)(?:%|%RH|パーセント)?$/i;
+  const match = normalized.match(pattern);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) && (kind === 'temperature' ? value >= -50 && value <= 80 : value >= 0 && value <= 100) ? value : null;
+}
+
+function japaneseDayNumber_(value) {
+  if (/^\d+$/.test(value)) return Number(value);
+  const digits = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  if (value === '十') return 10;
+  if (/^[一二三四五六七八九]?十[一二三四五六七八九]?$/.test(value)) {
+    const parts = value.split('十');
+    if (parts.length !== 2) return null;
+    return (parts[0] ? digits[parts[0]] : 1) * 10 + (parts[1] ? digits[parts[1]] : 0);
+  }
+  return digits[value] || null;
+}
+
+function parseRearingResponse_(text) {
+  let data;
+  try { data = JSON.parse(text); }
+  catch (error) { throw new Error('Geminiの飼育環境の解析JSONを読み取れません。'); }
+  if (!data || Array.isArray(data) || typeof data !== 'object' ||
+      typeof data.feeling !== 'string' || !data.feeling.trim() ||
+      ['stageText', 'temperatureText', 'humidityText'].some(function (key) {
+        return !Object.prototype.hasOwnProperty.call(data, key) ||
+          data[key] !== null && (typeof data[key] !== 'string' || data[key].length > 120);
+      })) throw new Error('Geminiの飼育環境の解析形式が不正です。');
+  const label = (data.stageText || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+  const instarValues = Array.from(label.matchAll(/([1-5一二三四五])\s*[令齢]/g))
+    .map(function (match) { return japaneseDayNumber_(match[1]); });
+  const distinctInstars = Array.from(new Set(instarValues));
+  const sleepMatch = label.match(/([1-4一二三四])\s*眠(?!\s*(?:明け|後|から|終了))/);
+  let instar = distinctInstars.length === 1 ? distinctInstars[0] :
+    distinctInstars.length === 0 && sleepMatch ? japaneseDayNumber_(sleepMatch[1]) : null;
+  const sleeping = sleepMatch && (!distinctInstars.length || japaneseDayNumber_(sleepMatch[1]) === instar);
+  const dayMatch = label.match(/([1-5一二三四五])\s*[令齢][\s:：・()（）の-]*([0-9一二三四五六七八九十]+)\s*日/);
+  const hatchMatch = label.match(/(?:孵化|ふ化|ふか|飼育|生後)(?:後|から)?[\s:：]*([0-9一二三四五六七八九十]+)\s*日/);
+  const phase = /営繭|上蔟|まぶし|繭作り|繭づくり/.test(label) ? 'spinning' :
+    /蛹|さなぎ|サナギ/.test(label) ? 'pupa' :
+    /成虫|羽化|蛾/.test(label) ? 'adult' : sleeping ? 'sleeping' : instar ? 'larva' : 'unknown';
+  if (phase === 'pupa' || phase === 'adult') instar = null;
+  const observation = {
+    stageText: data.stageText, instar: instar,
+    instarDay: dayMatch && japaneseDayNumber_(dayMatch[1]) === instar ? japaneseDayNumber_(dayMatch[2]) : null,
+    hatchDay: hatchMatch ? japaneseDayNumber_(hatchMatch[1]) : null,
+    phase: phase,
+    temperatureText: data.temperatureText, temperatureC: readUiNumber_(data.temperatureText, 'temperature'),
+    humidityText: data.humidityText, humidityPercent: readUiNumber_(data.humidityText, 'humidity')
+  };
+  observation.reference = rearingReference_(observation);
+  return { feeling: data.feeling.replace(/\s+/g, ' ').trim(), observation: observation };
+}
+
+function rearingReference_(observation) {
+  if (observation.phase === 'spinning') return { temperatureC: 23, humidityPercent: 60, temperatureRange: null };
+  const instar = observation.instar;
+  if (!instar) return { temperatureC: null, humidityPercent: null, temperatureRange: null };
+  return { temperatureC: 30 - instar, humidityPercent: instar === 4 ? null : 75,
+    temperatureRange: instar <= 3 ? [27, 29] : null };
+}
+
+function rearingMismatch_() {
+  const error = waitError_('画像UI・飼育目安と合わない温湿度や日数の表現があるため、投稿せず次の解析を待ちます。');
+  error.botStatus = 'care_mismatch';
+  return error;
+}
+
+function validateRearingFeeling_(feeling, observation) {
+  const text = feeling.normalize('NFKC');
+  const temperature = observation.temperatureC;
+  if (/(暑|あつい|熱い|熱く|熱すぎ|灼熱|焼けそう)/.test(text) && !(temperature !== null && temperature >= 34)) throw rearingMismatch_();
+  if (/(寒|さむ|冷え|ひえ|冷た|ひんやり|ヒンヤリ|凍え|こごえ)/.test(text) && !(temperature !== null && temperature <= 18)) throw rearingMismatch_();
+  if (/(じめじめ|ジメジメ|じとじと|ジトジト|むしむし|ムシムシ|湿っぽ|湿気で|蒸れ|蒸し暑|ベタベタ|べたべた|空気がカラカラ|乾燥して(?:つら|辛|苦))/.test(text)) throw rearingMismatch_();
+  if (/(?:湿度|湿気).{0,12}(?:つら|辛|苦|イヤ|いや|不快|高すぎ|低すぎ|たまら)/.test(text)) throw rearingMismatch_();
+  if (temperature !== null && (temperature >= 34 || temperature <= 18) &&
+      /(快適|ばっちり|バッチリ|ちょうどい|居心地がい|過ごしやす)/.test(text)) throw rearingMismatch_();
+  const reference = observation.reference;
+  const comfortableByReference = temperature !== null && reference.temperatureC !== null &&
+    (reference.temperatureRange
+      ? temperature >= reference.temperatureRange[0] && temperature <= reference.temperatureRange[1]
+      : temperature === reference.temperatureC);
+  if (/(快適|温度.{0,8}ちょうど|温湿度.{0,8}ばっちり|温度.{0,8}いい感じ)/.test(text) && !comfortableByReference) throw rearingMismatch_();
+  const temperatures = Array.from(text.matchAll(/([+-]?\d+(?:\.\d+)?)\s*(?:℃|°\s*C|度)/g));
+  if (temperatures.some(function (match) { return temperature === null || Number(match[1]) !== temperature; })) throw rearingMismatch_();
+  const humidities = Array.from(text.matchAll(/(\d+(?:\.\d+)?)\s*(?:%|パーセント)/g));
+  if (humidities.some(function (match) { return observation.humidityPercent === null || Number(match[1]) !== observation.humidityPercent; })) throw rearingMismatch_();
+  const stages = Array.from(text.matchAll(/([1-5一二三四五])\s*[令齢]/g));
+  if (stages.some(function (match) { return japaneseDayNumber_(match[1]) !== observation.instar; })) throw rearingMismatch_();
+  const days = Array.from(text.matchAll(/([0-9一二三四五六七八九十]+)\s*日目/g));
+  if (days.some(function (match) {
+    const value = japaneseDayNumber_(match[1]);
+    return value === null || !Number.isFinite(value) || value !== observation.instarDay && value !== observation.hatchDay;
+  })) throw rearingMismatch_();
+  if (observation.phase === 'sleeping' && /(もぐもぐ|モグモグ|むしゃむしゃ|ムシャムシャ|食べて|食べる|モリモリ|もりもり)/.test(text)) throw rearingMismatch_();
 }

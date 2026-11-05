@@ -22,7 +22,7 @@ function harness(options = {}) {
   let now = options.now ?? Date.now();
   const calls = { triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
-  const values = { GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
+  const values = { ENABLE_REARING_CONTEXT: 'false', GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
     TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
     GEMINI_DAILY_REQUEST_BUDGET: '144', YOUTUBE_MIN_INTERVAL_MINUTES: '10', X_DAILY_POST_BUDGET: '48', X_31DAY_POST_BUDGET: '1600',
@@ -1628,7 +1628,7 @@ test('個人側の投稿文プレビューは外部サービス・スコープ�
   const preview = h.context.previewPreparedComment();
   assert.equal(preview.name, 'こはく');
   assert.equal(preview.date, '2026/11/05');
-  assert.equal(preview.messageText, '2026/11/05｜語り手：こはく\n' + school.state().feeling);
+  assert.equal(preview.messageText, '2026/11/05\nこはく：' + school.state().feeling);
   assert.equal(h.context.previewPreparedComment().messageText, preview.messageText);
   assert.equal(JSON.stringify(h.values), before);
   assert.equal(h.calls.scopes.length, 0);
@@ -1651,7 +1651,7 @@ test('個人側は投稿日の日本時間・最初の名前・準備済み本�
   const h = personalWithPrepared(school, { now: school.now() });
   assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
   const message = h.calls.chats[0].payload.snippet.textMessageDetails.messageText;
-  assert.equal(message, '2026/11/05｜語り手：こはく\n' + school.state().feeling);
+  assert.equal(message, '2026/11/05\nこはく：' + school.state().feeling);
   assert.equal(h.state().youtubeComment.text, message);
   assert.equal(h.state().youtubeComment.name, 'こはく');
   assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 1);
@@ -1832,4 +1832,249 @@ test('一括処理でも日付と名前を付け状態に保存する', () => {
   assert.equal(h.state().youtubeComment.date, '2026/11/05');
   assert.equal(h.state().youtubeComment.name, 'こはく');
   assert.equal(h.calls.gemini.length, 1);
+});
+
+const CARE_PROPERTIES = { ...VARIATION_PROPERTIES, ENABLE_NAMED_COMMENTS: 'true', ENABLE_REARING_CONTEXT: 'true' };
+const careResponse = (feeling = '葉っぱのそばが、ぼくの特等席。', ui = {}) => geminiResponse(JSON.stringify({
+  stageText: '1令3日目', temperatureText: '28℃', humidityText: '79%', feeling, ...ui
+}));
+
+test('飼育環境読取りは初期有効で同じ1回のAPIからUIと気持ちを得る', () => {
+  const h = preparedSchool({ properties: { ENABLE_REARING_CONTEXT: undefined }, geminiResponses: [careResponse()] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const request = JSON.parse(h.calls.gemini[0].request.payload);
+  assert.equal(request.generationConfig.responseMimeType, 'application/json');
+  assert.equal(request.generationConfig.maxOutputTokens, 512);
+  assert.ok(request.generationConfig.responseJsonSchema.required.includes('stageText'));
+  assert.ok(request.systemInstruction.parts[0].text.includes('1令29℃'));
+  assert.ok(request.systemInstruction.parts[0].text.includes('設定値や目安値と混同しない'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.state().rearing.instar, 1);
+  assert.equal(h.state().rearing.instarDay, 3);
+  assert.equal(h.state().rearing.temperatureC, 28);
+  assert.equal(h.state().rearing.humidityPercent, 79);
+  assert.equal(h.state().rearing.reference.temperatureC, 29);
+  assert.equal(h.state().rearing.reference.humidityPercent, 75);
+  assert.equal(h.state().analysisVersion, 'rearing-v1');
+});
+
+test('1から5令の温度目安はUIの令に対応し4令の湿度を補わない', () => {
+  const h = preparedSchool();
+  for (let instar = 1; instar <= 5; instar++) {
+    const result = h.context.parseRearingResponse_(JSON.stringify({
+      stageText: instar + '令2日目', temperatureText: '28℃', humidityText: '79%', feeling: 'ぼくのペースでいこうかな。'
+    }));
+    assert.equal(result.observation.reference.temperatureC, 30 - instar);
+    assert.equal(result.observation.reference.humidityPercent, instar === 4 ? null : 75);
+    assert.equal(result.observation.instarDay, 2);
+  }
+});
+
+test('1から3令の27から29℃で暑いとする本文を見送る', () => {
+  for (const [instar, temperature] of [[1, 29], [2, 28], [3, 27]]) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+      careResponse('暑くてたまらないなあ。', { stageText: instar + '令3日目', temperatureText: temperature + '℃' })
+    ] });
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+    assert.equal(h.calls.logs.length, 0);
+    assert.equal(h.values.YOSAN_STATE_V1, undefined);
+    assert.equal(h.calls.gemini.length, 1);
+    assert.ok(h.calls.console.some(line => line.includes('画像UIの読取り:')));
+  }
+});
+
+test('目安に近い湿度でジメジメや湿っぽいとする本文を見送る', () => {
+  for (const feeling of ['湿っぽくて体が重いなあ。', '湿度79%でジメジメするよ。', '湿度が高くてつらいな。']) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling)] });
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+    assert.equal(h.calls.gemini.length, 1);
+    assert.equal(h.calls.logs.length, 0);
+  }
+});
+
+test('温度と湿度が近い目安から少し違っても捏造せず中立の気持ちを準備する', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('1令3日目、葉っぱのそばでひと休み気分。')
+  ] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().rearing.temperatureC, 28);
+  assert.equal(h.state().rearing.humidityPercent, 79);
+  assert.equal(h.state().feeling, '1令3日目、葉っぱのそばでひと休み気分。');
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('危険域の温度を快適とする本文は見送り高温への心配は許容する', () => {
+  const bad = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('35℃で快適だな。', { temperatureText: '35℃' })
+  ] });
+  assert.equal(bad.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+  const good = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('画面は35℃、暑さが心配だな。', { temperatureText: '35℃' })
+  ] });
+  assert.equal(good.context.analyzeLatestImageAndLog().status, 'prepared');
+});
+
+test('目安の範囲が不明な段階では快適と断定せず知らない日数も補わない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('今日は快適な温度だよ。', { stageText: null })
+  ] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+  const neutral = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('ここでのんびり過ごしたい気分。', { stageText: null, temperatureText: null, humidityText: null })
+  ] });
+  assert.equal(neutral.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(neutral.state().rearing.instar, null);
+  assert.equal(neutral.state().rearing.reference.temperatureC, null);
+});
+
+test('孵化後の日数だけから令を計算せずUIの令を優先する', () => {
+  const h = preparedSchool();
+  const total = h.context.parseRearingResponse_(JSON.stringify({
+    stageText: '孵化後：9日目', temperatureText: '28℃', humidityText: '79%', feeling: '9日目、のんびり気分。'
+  }));
+  assert.equal(total.observation.instar, null);
+  assert.equal(total.observation.hatchDay, 9);
+  assert.equal(total.observation.reference.temperatureC, null);
+  h.context.validateRearingFeeling_(total.feeling, total.observation);
+  assert.throws(() => h.context.validateRearingFeeling_('3令になったぼくだよ。', total.observation), e => e.botStatus === 'care_mismatch');
+  const explicit = h.context.parseRearingResponse_(JSON.stringify({
+    stageText: '2令1日目 孵化後9日目', temperatureText: '28℃', humidityText: '79%', feeling: 'のんびり気分。'
+  }));
+  assert.equal(explicit.observation.instar, 2);
+  assert.equal(explicit.observation.instarDay, 1);
+  assert.equal(explicit.observation.hatchDay, 9);
+});
+
+test('全角や漢数字のUIを読み混在した令を一つに決めつけない', () => {
+  const h = preparedSchool();
+  const parse = stageText => h.context.parseRearingResponse_(JSON.stringify({
+    stageText, temperatureText: '温度：２８．５℃', humidityText: '湿度：７９％', feeling: 'のんびり気分。'
+  })).observation;
+  const observation = parse('一齢 三日目');
+  assert.equal(observation.instar, 1);
+  assert.equal(observation.instarDay, 3);
+  assert.equal(observation.temperatureC, 28.5);
+  assert.equal(observation.humidityPercent, 79);
+  assert.equal(parse('1令3日目・2令1日目').instar, null);
+  assert.equal(parse('3令1日目 2眠明け').phase, 'larva');
+});
+
+test('眠中は食べている描写を見送り営繭中の目安は23℃60％に切り替わる', () => {
+  const sleeping = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('もぐもぐ食べているよ。', { stageText: '3眠' })
+  ] });
+  assert.equal(sleeping.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('繭の準備に集中したい気分。', { stageText: '5令8日目 営繭', temperatureText: '23℃', humidityText: '60%' })
+  ] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().rearing.phase, 'spinning');
+  assert.equal(h.state().rearing.reference.temperatureC, 23);
+  assert.equal(h.state().rearing.reference.humidityPercent, 60);
+});
+
+test('写真から読み取れない数値と本文の食い違いを見送る', () => {
+  for (const feeling of ['温度は30℃でいい気分。', '湿度は75%でのんびり。', '2令3日目のぼくだよ。', '1令4日目のぼくだよ。']) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling)] });
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+  }
+  const unknown = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('温度は28℃だよ。', { temperatureText: '27〜29℃' })
+  ] });
+  assert.equal(unknown.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+});
+
+test('解析JSONが壊れている場合は本文だけを採用して投稿しない', () => {
+  for (const text of ['快適だよ。', '{"feeling":"のんびり。"}', '[]']) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [geminiResponse(text)] });
+    assert.throws(() => h.context.analyzeLatestImageAndLog(), /飼育環境/);
+    assert.equal(h.calls.logs.length, 0);
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('新解析形式では古いプレビューを再利用せず新しいUI情報を保存する', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_REARING_CONTEXT: 'false' }, geminiResponses: [
+    geminiResponse('暑いなあ。'), careResponse()
+  ] });
+  h.context.previewSchoolAnalysis();
+  assert.equal(h.calls.gemini.length, 1);
+  h.values.ENABLE_REARING_CONTEXT = 'true';
+  h.advance(3600000);
+  assert.equal(h.context.previewSchoolAnalysis().status, 'preview');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_PREVIEW_V1).analysisVersion, 'rearing-v1');
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.state().rearing.instarDay, 3);
+});
+
+test('個人側は古い未検証の準備済み文を投稿せず学校の新解析を待つ', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { properties: { ENABLE_REARING_CONTEXT: 'true' } });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'waiting_analysis');
+  assert.equal(h.context.previewPreparedComment().status, 'waiting_analysis');
+  assert.equal(h.calls.videos.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('日付と名前コロンの投稿形式でUIに基づく気持ちを共有し追加AI呼出しをしない', () => {
+  const school = preparedSchool({ now: Date.parse('2026-11-05T12:00:00Z'), properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { now: school.now() });
+  assert.equal(h.context.previewPreparedComment().messageText, '2026/11/05\nこはく：葉っぱのそばが、ぼくの特等席。');
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText, '2026/11/05\nこはく：葉っぱのそばが、ぼくの特等席。');
+  assert.equal(school.calls.gemini.length, 1);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 1);
+});
+
+test('飼育目安への不一致でもAPI予算を消費し即時の再生成をしない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '1' }, geminiResponses: [careResponse('暑いよ。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'care_mismatch');
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('飼育目安の新版移行でもunknownの送信状態を解除しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const state = school.state(); state.youtube = 'unknown'; school.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  school.values.ENABLE_REARING_CONTEXT = 'true';
+  school.advance(3600000); school.refreshImage();
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'unknown');
+  assert.equal(school.calls.gemini.length, 1);
+  const h = personalWithPrepared(school);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'unknown');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('気持ちの視点は12通りあり本文の話題を食事や温湿度だけにしない', () => {
+  const h = preparedSchool();
+  const prompts = [];
+  for (let count = 0; count < 12; count++) {
+    h.values.YOSAN_LIMITS_V1 = JSON.stringify({ gemini: { count } });
+    prompts.push(h.context.variedFeelingPrompt_([]));
+  }
+  assert.equal(new Set(prompts).size, 12);
+  assert.ok(prompts.some(text => text.includes('仲間')));
+  assert.ok(prompts.some(text => text.includes('居場所')));
+  assert.ok(prompts.some(text => text.includes('食事以外')));
+});
+
+test('一括処理の初期有効モードもUIを読み日付名前付き本文を1回で投稿する', () => {
+  const h = harness({ properties: { ENABLE_REARING_CONTEXT: undefined, ENABLE_NAMED_COMMENTS: 'true' },
+    geminiResponses: [careResponse()] });
+  assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.state().analysisVersion, 'rearing-v1');
+  assert.equal(h.state().rearing.instar, 1);
+  assert.equal(h.state().rearing.reference.temperatureC, 29);
+  assert.ok(h.calls.chats[0].payload.snippet.textMessageDetails.messageText.includes('\nこはく：'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.chats.length, 1);
 });
