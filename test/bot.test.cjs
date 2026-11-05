@@ -144,7 +144,8 @@ function harness(options = {}) {
       formatDate: (date, timezone, format) => {
         if (format === 'yyyy-MM-dd') return new Intl.DateTimeFormat('sv-SE', { timeZone: timezone }).format(date);
         assert.equal(timezone, 'Asia/Tokyo');
-        return new Date(date.getTime() + 9 * 3600000).toISOString().slice(0, 19).replace('T', ' ').replace(/-/g, '/');
+        const formatted = new Date(date.getTime() + 9 * 3600000).toISOString().slice(0, 19).replace('T', ' ').replace(/-/g, '/');
+        return format === 'yyyy/MM/dd' ? formatted.slice(0, 10) : formatted;
       },
       sleep: (ms) => calls.sleeps.push(ms)
     },
@@ -690,7 +691,7 @@ test('YouTubeのクォータ予算が足りなければ未送信のpendingを維
 });
 
 test('YouTubeのquotaExceededでは次の日までAPIを止める', () => {
-  const h = harness({ ownsChannel: false, searchFailure: new Error('quotaExceeded') });
+  const h = harness({ now: Date.parse('2026-11-05T12:00:00Z'), ownsChannel: false, searchFailure: new Error('quotaExceeded') });
   h.run();
   const searches = h.calls.searches.length;
   h.advance(60 * 60000); h.refreshImage(); h.run();
@@ -1572,4 +1573,263 @@ test('YouTube応答後に最後の投稿文を保存できなければunknownと
   personal.advance(3600000);
   assert.equal(personal.context.postPreparedCommentToYouTube().status, 'unknown');
   assert.equal(personal.calls.chats.length, 1);
+});
+
+const NAMED_PROPERTIES = { ENABLE_NAMED_COMMENTS: 'true' };
+
+test('名前付き設定は50個の名前を用意しキー・状態・予算・順番を維持する', () => {
+  const h = preparedSchool();
+  h.context.analyzeLatestImageAndLog();
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1); limits.youtube.nameSequence = 12;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  const before = { state: h.values.YOSAN_STATE_V1, limits: h.values.YOSAN_LIMITS_V1, key: h.values.GEMINI_API_KEY };
+  h.context.configureNamedCommentary();
+  const names = JSON.parse(h.values.SILKWORM_NAMES);
+  assert.equal(h.values.ENABLE_NAMED_COMMENTS, 'true');
+  assert.equal(names.length, 50);
+  assert.equal(new Set(names).size, 50);
+  assert.equal(h.values.YOSAN_STATE_V1, before.state);
+  assert.equal(h.values.YOSAN_LIMITS_V1, before.limits);
+  assert.equal(h.values.GEMINI_API_KEY, before.key);
+  assert.equal(h.values.YOUTUBE_MIN_INTERVAL_MINUTES, '10');
+});
+
+test('名前付き設定の再実行は自分の名簿を上書きしない', () => {
+  const h = preparedSchool({ properties: { SILKWORM_NAMES: '["こはる","まめ"]' } });
+  h.context.configureNamedCommentary();
+  h.context.configureNamedCommentary();
+  assert.equal(h.values.SILKWORM_NAMES, '["こはる","まめ"]');
+});
+
+test('名前の設定はJSON配列・個数・長さ・改行・重複を検証する', () => {
+  const h = preparedSchool();
+  for (const raw of ['invalid', '{}', '[]', '[null]', '[""]', '["a","Ａ"]', '["こはく"," こはく "]',
+    JSON.stringify(['a'.repeat(13)]), JSON.stringify(['こはく\nまゆ']), JSON.stringify(['こはく\u2028まゆ']),
+    JSON.stringify(Array.from({ length: 101 }, (_, i) => 'まゆ' + i))]) {
+    assert.throws(() => h.context.parseSilkwormNames_(raw), /SILKWORM_NAMES/);
+  }
+  assert.deepEqual(Array.from(h.context.parseSilkwormNames_('[" こはく ","🐛"]')), ['こはく', '🐛']);
+  assert.equal(h.context.parseSilkwormNames_(JSON.stringify(['🐛'.repeat(12)])).length, 1);
+});
+
+test('不正な名前の設定では投稿や解析APIを呼ばない', () => {
+  const h = preparedSchool({ properties: { ...NAMED_PROPERTIES, SILKWORM_NAMES: '[""]' } });
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), /SILKWORM_NAMES/);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('個人側の投稿文プレビューは外部サービス・スコープ要求・状態保存を行わない', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { now: Date.parse('2026-11-04T15:30:00Z') });
+  delete h.context.YouTube;
+  const before = JSON.stringify(h.values);
+  const preview = h.context.previewPreparedComment();
+  assert.equal(preview.name, 'こはく');
+  assert.equal(preview.date, '2026/11/05');
+  assert.equal(preview.messageText, '2026/11/05｜語り手：こはく\n' + school.state().feeling);
+  assert.equal(h.context.previewPreparedComment().messageText, preview.messageText);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.scopes.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.videos.length, 0);
+});
+
+test('投稿文プレビューは解析済みデータがなければ待機する', () => {
+  const h = preparedSchool({ properties: NAMED_PROPERTIES });
+  assert.equal(h.context.previewPreparedComment().status, 'waiting_analysis');
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('個人側は投稿日の日本時間・最初の名前・準備済み本文を送る', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES, now: Date.parse('2026-11-04T15:30:00Z'),
+    files: [{ updated: Date.parse('2020-01-01T00:00:00Z') }] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { now: school.now() });
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  const message = h.calls.chats[0].payload.snippet.textMessageDetails.messageText;
+  assert.equal(message, '2026/11/05｜語り手：こはく\n' + school.state().feeling);
+  assert.equal(h.state().youtubeComment.text, message);
+  assert.equal(h.state().youtubeComment.name, 'こはく');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 1);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('日付はプレビュー日でなく実際に送る日の日本時間で組み立てる', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { now: Date.parse('2026-11-04T14:59:59Z') });
+  assert.equal(h.context.previewPreparedComment().date, '2026/11/04');
+  h.advance(2000);
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.state().youtubeComment.date, '2026/11/05');
+  assert.equal(h.state().youtubeComment.name, 'こはく');
+});
+
+test('50個の名前は成功ごとに順番を進め日付をまたいでも続きから一周する', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { now: Date.parse('2026-11-05T12:00:00Z') });
+  const used = [];
+  for (let i = 0; i < 51; i++) {
+    assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+    used.push(h.state().youtubeComment.name);
+    h.advance(3600000);
+  }
+  assert.equal(new Set(used.slice(0, 50)).size, 50);
+  assert.equal(used[0], 'こはく');
+  assert.equal(used[1], 'まゆ');
+  assert.equal(used[49], 'りん');
+  assert.equal(used[50], 'こはく');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 51);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('名簿を変更した場合は保存済みの順番を新しい名簿に適用する', () => {
+  const school = preparedSchool({ properties: { ...NAMED_PROPERTIES, SILKWORM_NAMES: '["こはる","まめ"]' } });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const used = [];
+  for (let i = 0; i < 3; i++) {
+    h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+    used.push(h.state().youtubeComment.name);
+    h.advance(3600000);
+  }
+  assert.deepEqual(used, ['こはる', 'まめ', 'こはる']);
+});
+
+test('名前を変えても同じ本文の再投稿を防ぐ', () => {
+  const school = preparedSchool({ properties: { ...VARIATION_PROPERTIES, ...NAMED_PROPERTIES } });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  h.context.postPreparedCommentToYouTube();
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'waiting_fresh_analysis');
+  const state = h.state(); state.youtube = 'pending'; h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'waiting_fresh_analysis');
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1);
+  assert.equal(limits.youtube.nameSequence, 1);
+  assert.equal(limits.youtube.lastText, school.state().feeling);
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('学校が新しい本文を用意したら次の名前で投稿しGeminiを追加で呼ばない', () => {
+  const school = preparedSchool({ properties: { ...VARIATION_PROPERTIES, ...NAMED_PROPERTIES }, geminiResponses: [
+    geminiResponse('白い体が並んで、ここがぼくの特等席。'),
+    geminiResponse('この葉っぱの模様、みんなは何に見える？')
+  ] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  school.values.YOSAN_STATE_V1 = h.values.YOSAN_STATE_V1;
+  school.values.YOSAN_LIMITS_V1 = h.values.YOSAN_LIMITS_V1;
+  school.advance(3600000); h.advance(3600000);
+  assert.equal(school.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'prepared');
+  h.values.YOSAN_STATE_V1 = school.values.YOSAN_STATE_V1;
+  h.values.YOSAN_LIMITS_V1 = school.values.YOSAN_LIMITS_V1;
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  assert.equal(h.state().youtubeComment.name, 'まゆ');
+  assert.equal(school.calls.gemini.length, 2);
+  assert.equal(school.calls.logs.length, 2);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('APIの応答が不明なら名前の順番を進めず写真が変わっても再送しない', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { chatFailure: new Error('network disconnected') });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(h.state().youtubeComment.name, 'こはく');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'unknown');
+  school.values.YOSAN_STATE_V1 = h.values.YOSAN_STATE_V1;
+  school.advance(3600000); school.refreshImage();
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'unknown');
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('明確な投稿拒否では同じ順番を維持して次の成功で進める', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES }); school.context.analyzeLatestImageAndLog();
+  const rejected = new Error('rejected'); rejected.definitelyRejected = true;
+  const h = personalWithPrepared(school, { chatFailure: rejected });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(h.state().youtube, 'pending');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+  h.context.YouTube.LiveChatMessages.insert = (payload, part) => {
+    h.calls.chats.push({ payload: clone(payload), part }); return { id: 'message-2' };
+  };
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.state().youtubeComment.name, 'こはく');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 1);
+});
+
+test('予算待ちは名前を消費せず次の投稿で同じ名前を使う', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES }); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { properties: { YOUTUBE_DAILY_UNIT_BUDGET: '49' } });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'rate_limited');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+  h.values.YOUTUBE_DAILY_UNIT_BUDGET = '8000';
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.state().youtubeComment.name, 'こはく');
+});
+
+test('送信前の状態保存に失敗したら名前付きの投稿を始めない', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES }); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { failPropertyWrite: (name, value) => name === 'YOSAN_STATE_V1' && value.includes('"youtube":"sending"') });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+});
+
+test('API成功後に名前の順番を保存できなければunknownにして再送しない', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES }); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { failPropertyWrite: (name, value) => name === 'YOSAN_LIMITS_V1' && value.includes('"nameSequence"') });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(h.state().youtube, 'unknown');
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'unknown');
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('成功応答後の状態保存失敗でも確認済みの名前の順番は残る', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES }); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { failPropertyWrite: (name, value) => name === 'YOSAN_STATE_V1' && value.includes('"youtube":"sent"') });
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 1);
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('名前の順番が不正ならAPIを呼ばず停止する', () => {
+  const school = preparedSchool({ properties: NAMED_PROPERTIES }); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1); limits.youtube.nameSequence = -1;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'error');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.videos.length, 0);
+});
+
+test('無効時は従来の見出しを維持し無効な名簿も参照しない', () => {
+  const h = harness({ properties: { ENABLE_NAMED_COMMENTS: 'false', SILKWORM_NAMES: 'invalid' } });
+  assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText,
+    '【今の蚕の気持ち💭】\n' + h.state().feeling);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+});
+
+test('一括処理でも日付と名前を付け状態に保存する', () => {
+  const h = harness({ now: Date.parse('2026-11-04T15:00:00Z'), properties: NAMED_PROPERTIES });
+  assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.state().youtubeComment.date, '2026/11/05');
+  assert.equal(h.state().youtubeComment.name, 'こはく');
+  assert.equal(h.calls.gemini.length, 1);
 });

@@ -14,6 +14,58 @@ const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
+const DEFAULT_SILKWORM_NAMES = [
+  "こはく",
+  "まゆ",
+  "しらたま",
+  "もち",
+  "だいふく",
+  "きなこ",
+  "あずき",
+  "よもぎ",
+  "さくら",
+  "こむぎ",
+  "くるみ",
+  "みるく",
+  "とうふ",
+  "おもち",
+  "わたげ",
+  "わたあめ",
+  "ゆき",
+  "しずく",
+  "つむぎ",
+  "いと",
+  "きぬ",
+  "さら",
+  "ふわり",
+  "もこ",
+  "ぽぽ",
+  "まる",
+  "ころん",
+  "のん",
+  "ひなた",
+  "こもれび",
+  "そら",
+  "くも",
+  "にじ",
+  "ほし",
+  "つき",
+  "あさひ",
+  "はる",
+  "なつ",
+  "あき",
+  "ふゆ",
+  "すみれ",
+  "たんぽぽ",
+  "れんげ",
+  "なずな",
+  "わかば",
+  "このは",
+  "くわ",
+  "みどり",
+  "すず",
+  "りん"
+];
 
 function processLatestImageAndLog(event) {
   return runBot_(false, Boolean(event && event.triggerUid));
@@ -73,7 +125,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
 
     let state = readJsonProperty_(properties, BOT_STATE_KEY);
     if (!state || state.key !== image.key) {
-      const blocked = config.varyFeelings && state && ['sending', 'unknown'].indexOf(state.youtube) !== -1;
+      const blocked = (config.varyFeelings || config.enableNamedComments) && state && ['sending', 'unknown'].indexOf(state.youtube) !== -1;
       if (blocked) state.youtube = 'unknown';
       else state = { key: image.key, feeling: null, logged: false, youtube: 'pending', x: 'pending', instagram: 'pending' };
     }
@@ -91,7 +143,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
       else if (config.triggerDriven || Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
     }
     const refreshRequested = config.varyFeelings && Boolean(refreshFeeling || triggerDriven);
-    if (config.varyFeelings && state.youtube === 'unknown') {
+    if ((config.varyFeelings || config.enableNamedComments) && state.youtube === 'unknown') {
       saveState_(properties, state);
       console.log('前回の投稿結果が不明なため、実況文の更新も確認まで待機します。');
       return { status: 'unknown', youtube: 'unknown' };
@@ -126,8 +178,9 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
       try {
         const live = findActiveLive_(config);
         if (live && live.liveChatId) {
+          const comment = prepareYouTubeComment_(state, config);
           sendWithState_(properties, state, 'youtube', function () {
-            const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
+            const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config, comment);
             state.youtubeSentAt = Date.now();
             return id;
           });
@@ -197,6 +250,7 @@ function getConfig_(analysisOnly) {
     xDailyBudget: integerBudgetProperty_(values, 'X_DAILY_POST_BUDGET', 1),
     xMonthlyBudget: integerBudgetProperty_(values, 'X_31DAY_POST_BUDGET', 40)
   };
+  Object.assign(config, namedCommentConfig_(values));
   if (!/^[a-zA-Z0-9._-]+$/.test(config.geminiModel)) {
     throw new Error('GEMINI_MODELにはモデル名だけを指定してください。');
   }
@@ -268,7 +322,7 @@ function getLimitState_() {
     if (!state[name] || typeof state[name] !== 'object' || Array.isArray(state[name])) {
       throw new Error('BOTの制限状態が壊れています。' + BOT_LIMITS_KEY + ' を確認してください。');
     }
-    ['count', 'lastAttempt', 'lastPost', 'cooldownUntil'].forEach(function (key) {
+    ['count', 'lastAttempt', 'lastPost', 'cooldownUntil', 'nameSequence'].forEach(function (key) {
       const value = state[name][key];
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
         throw new Error('BOTの制限状態に不正な数値があります。' + BOT_LIMITS_KEY + ' を確認してください。');
@@ -666,14 +720,15 @@ function getLiveDetails_(ids, channelId, config) {
   return { videoId: active[0].id, liveChatId: active[0].liveStreamingDetails.activeLiveChatId || null };
 }
 
-function postLatestCommentToYouTube(feelingText, liveChatId, config) {
+function postLatestCommentToYouTube(feelingText, liveChatId, config, comment) {
+  comment = comment || buildYouTubeComment_(feelingText, config);
   reserveYouTubeUnits_(config, 50, true);
   let result;
   try {
     result = YouTube.LiveChatMessages.insert({
       snippet: {
         liveChatId: liveChatId, type: 'textMessageEvent',
-        textMessageDetails: { messageText: '【今の蚕の気持ち💭】\n' + feelingText }
+        textMessageDetails: { messageText: comment.text }
       }
     }, 'snippet');
   } catch (error) {
@@ -681,9 +736,10 @@ function postLatestCommentToYouTube(feelingText, liveChatId, config) {
     throw error;
   }
   if (!result || !result.id) throw new Error('YouTube投稿の成功応答が確認できません。');
-  if (config.varyFeelings) {
+  if (config.varyFeelings || config.enableNamedComments) {
     const limits = getLimitState_();
-    limits.youtube.lastText = feelingText;
+    if (config.varyFeelings) limits.youtube.lastText = feelingText;
+    if (config.enableNamedComments) limits.youtube.nameSequence = comment.sequence + 1;
     saveLimitState_(limits);
   }
   return result.id;
@@ -977,7 +1033,8 @@ function getYouTubeOnlyConfig_(event) {
   const properties = PropertiesService.getScriptProperties();
   const values = {};
   ['DRY_RUN', 'CHANNEL_ID', 'YOUTUBE_VIDEO_ID', 'LIVE_SEARCH_INTERVAL_MINUTES',
-    'YOUTUBE_DAILY_UNIT_BUDGET', 'YOUTUBE_MIN_INTERVAL_MINUTES', 'ENABLE_FEELING_VARIATION'].forEach(function (name) {
+    'YOUTUBE_DAILY_UNIT_BUDGET', 'YOUTUBE_MIN_INTERVAL_MINUTES', 'ENABLE_FEELING_VARIATION',
+    'ENABLE_NAMED_COMMENTS', 'SILKWORM_NAMES'].forEach(function (name) {
     const value = properties.getProperty(name);
     if (value !== null) values[name] = value;
   });
@@ -991,6 +1048,7 @@ function getYouTubeOnlyConfig_(event) {
     varyFeelings: booleanProperty_(values, 'ENABLE_FEELING_VARIATION', false),
     triggerDriven: Boolean(event && event.triggerUid)
   };
+  Object.assign(config, namedCommentConfig_(values));
   if (config.searchIntervalMinutes < 60 || config.youtubeMinMinutes < 10) throw new Error('検索は60分以上、手動投稿は10分以上の間隔にしてください。');
   if (config.triggerDriven) config.youtubeMinMinutes = 1;
   return config;
@@ -1056,10 +1114,12 @@ function postPreparedCommentToYouTube(event) {
       console.log('個人側でライブチャットが見つかりません。動画ID・配信中・チャット有効を確認してください。');
       return { status: 'no_live', youtube: 'pending' };
     }
+    stage = '投稿文の組立';
+    const comment = prepareYouTubeComment_(state, config);
     stage = '送信前の状態保存';
     sendWithState_(properties, state, 'youtube', function () {
       stage = 'チャット投稿API';
-      const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config);
+      const id = postLatestCommentToYouTube(state.feeling, live.liveChatId, config, comment);
       state.youtubeSentAt = Date.now();
       stage = '投稿結果の保存';
       return id;
@@ -1253,4 +1313,76 @@ function rememberFeeling_(feeling, history) {
 function youtubeTextWasRecentlyPosted_(feeling) {
   const last = getLimitState_().youtube.lastText;
   return typeof last === 'string' && similarFeelings_(feeling, last);
+}
+
+
+/** 名前は画像の個体識別ではなく、実況の語り手を順番に選ぶ。 */
+function namedCommentConfig_(values) {
+  const enabled = booleanProperty_(values, 'ENABLE_NAMED_COMMENTS', false);
+  return { enableNamedComments: enabled,
+    silkwormNames: enabled ? parseSilkwormNames_(values.SILKWORM_NAMES) : [] };
+}
+
+function parseSilkwormNames_(raw) {
+  let names;
+  try { names = raw === undefined || raw === null ? DEFAULT_SILKWORM_NAMES.slice() : JSON.parse(raw); }
+  catch (error) { throw new Error('SILKWORM_NAMESは名前のJSON配列にしてください。例: ["こはく","まゆ"]'); }
+  if (!Array.isArray(names) || names.length < 1 || names.length > 100 ||
+      names.some(function (name) {
+        return typeof name !== 'string' || !name.trim() || Array.from(name.trim()).length > 12 ||
+          /[\u0000-\u001f\u007f\u2028\u2029]/.test(name);
+      })) {
+    throw new Error('SILKWORM_NAMESは1〜100個、各1〜12文字の名前にしてください。改行・制御文字は使えません。');
+  }
+  names = names.map(function (name) { return name.trim(); });
+  const normalized = names.map(function (name) { return name.normalize('NFKC').toLowerCase(); });
+  if (new Set(normalized).size !== names.length) throw new Error('SILKWORM_NAMESに同じ名前が重複しています。');
+  return names;
+}
+
+function buildYouTubeComment_(feeling, config) {
+  if (!config.enableNamedComments) return { text: '【今の蚕の気持ち💭】\n' + feeling };
+  const sequence = getLimitState_().youtube.nameSequence || 0;
+  if (sequence >= Number.MAX_SAFE_INTEGER) throw new Error('名前の順番の保存値を確認してください。');
+  const name = config.silkwormNames[sequence % config.silkwormNames.length];
+  const date = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
+  return { name: name, date: date, sequence: sequence,
+    text: date + '｜語り手：' + name + '\n' + feeling };
+}
+
+function prepareYouTubeComment_(state, config) {
+  const comment = buildYouTubeComment_(state.feeling, config);
+  if (config.enableNamedComments) state.youtubeComment = comment;
+  return comment;
+}
+
+/** 鍵・投稿状態・使用量・名前の順番は維持して有効化する。 */
+function configureNamedCommentary() {
+  const properties = PropertiesService.getScriptProperties();
+  const existing = properties.getProperty('SILKWORM_NAMES');
+  const names = parseSilkwormNames_(existing);
+  if (existing === null) properties.setProperty('SILKWORM_NAMES', JSON.stringify(names));
+  properties.setProperty('ENABLE_NAMED_COMMENTS', 'true');
+  console.log('日付・名前付きの投稿を有効にしました。名前は' + names.length +
+    '個で、投稿成功ごとに順番に使います。画像の個体識別は行いません。');
+}
+
+/** 共有済みの実況文の表示だけを確認。API呼出し・状態保存・順番の更新なし。 */
+function previewPreparedComment() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return { status: 'busy' };
+  try {
+    const config = getYouTubeOnlyConfig_();
+    const state = readJsonProperty_(PropertiesService.getScriptProperties(), BOT_STATE_KEY);
+    if (!state || !state.logged || typeof state.feeling !== 'string' || !state.feeling.trim()) {
+      console.log('学校側でanalyzeLatestImageAndLogを実行し、解析・記録を完了してください。');
+      return { status: 'waiting_analysis' };
+    }
+    const comment = buildYouTubeComment_(state.feeling, config);
+    console.log('投稿文の確認（投稿なし）:\n' + comment.text);
+    return { status: 'preview', messageText: comment.text,
+      name: comment.name || null, date: comment.date || null };
+  } finally {
+    lock.releaseLock();
+  }
 }
