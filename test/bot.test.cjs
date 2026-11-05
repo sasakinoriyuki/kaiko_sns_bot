@@ -13,7 +13,7 @@ const response = (code, body, headers = {}) => ({
   getAllHeaders: () => headers,
   getContentText: () => typeof body === 'string' ? body : JSON.stringify(body)
 });
-const geminiResponse = (text = '桑の葉をもぐもぐ、おなかいっぱい！') => response(200, {
+const geminiResponse = (text = 'ぼく、桑の葉をもぐもぐ、おなかいっぱい！') => response(200, {
   candidates: [{ finishReason: 'STOP', content: { parts: [{ text }] } }]
 });
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -327,14 +327,14 @@ test('不正JSON・安全性ブロック・空回答・出力上限では投稿�
 });
 
 test('エラーという単語を含む正常回答も投稿できる', () => {
-  const h = harness({ geminiResponses: [geminiResponse('画面のエラーより、桑の葉が気になるなあ。')] });
+  const h = harness({ geminiResponses: [geminiResponse('ぼく、さっきのエラーより桑の葉が気になるなあ。')] });
   h.run();
   assert.equal(h.calls.chats.length, 1);
 });
 
 test('思考パートを除外し、Unicodeを壊さず70文字以内にする', () => {
   const h = harness({ geminiResponses: [response(200, { candidates: [{ finishReason: 'STOP', content: { parts: [
-    { text: '非公開の思考', thought: true }, { text: '蚕'.repeat(40) }, { text: '🐛'.repeat(40) }
+    { text: '非公開の思考', thought: true }, { text: 'ぼく、のんびり気分。' + '葉'.repeat(40) }, { text: '🐛'.repeat(40) }
   ] } }] })] });
   h.run();
   assert.equal(Array.from(h.state().feeling).length, 70);
@@ -372,10 +372,10 @@ test('既存シートの見出しが違えば書き換えず停止する', () =>
 });
 
 test('ファイル名とAI出力をスプレッドシートの数式として実行しない', () => {
-  const h = harness({ files: [{ name: '=HYPERLINK("x").png' }], geminiResponses: [geminiResponse('=1+1')] });
+  const h = harness({ files: [{ name: '=HYPERLINK("x").png' }], geminiResponses: [geminiResponse('=1+1 ぼくの気分')] });
   h.run();
   assert.ok(h.calls.logs[0][1].startsWith("'="));
-  assert.equal(h.calls.logs[0][2], "'=1+1");
+  assert.equal(h.calls.logs[0][2], "'=1+1 ぼくの気分");
 });
 
 test('YouTube成功後にXが429で失敗した場合、Xだけを再試行する', () => {
@@ -615,7 +615,7 @@ test('初期予算で24時間の10分トリガーを動かすとGemini・YouTube
 
 test('予算確認後の10分/30分設定を24時間動かして144解析・48X試行を超えない', () => {
   const h = harness({ now: Date.parse('2026-10-07T07:00:00Z'),
-    geminiResponses: Array.from({ length: 144 }, (_, i) => geminiResponse('桑の葉をもぐもぐ ' + i)) });
+    geminiResponses: Array.from({ length: 144 }, (_, i) => geminiResponse('ぼく、桑の葉をもぐもぐ幸せ ' + i)) });
   for (let i = 0; i < 144; i++) {
     if (i) h.advance(10 * 60000);
     h.refreshImage();
@@ -672,12 +672,12 @@ test('GeminiのRetry-Afterが日次リセットより長ければ短縮しない
 test('YouTubeは直接の手動呼び出しでも10分未満で再投稿しない', () => {
   const h = harness();
   const config = h.context.getConfig_();
-  h.context.postLatestCommentToYouTube('桑の葉がおいしい', 'chat-1', config);
+  h.context.postLatestCommentToYouTube('ぼく、桑の葉がおいしいな。', 'chat-1', config);
   h.advance(9 * 60000);
-  assert.throws(() => h.context.postLatestCommentToYouTube('まだもぐもぐ', 'chat-1', config), (error) => error.botWait);
+  assert.throws(() => h.context.postLatestCommentToYouTube('ぼく、まだもぐもぐ食べたいな。', 'chat-1', config), (error) => error.botWait);
   assert.equal(h.calls.chats.length, 1);
   h.advance(60000);
-  h.context.postLatestCommentToYouTube('桑の葉がおいしい', 'chat-1', config);
+  h.context.postLatestCommentToYouTube('ぼく、桑の葉がおいしいな。', 'chat-1', config);
   assert.equal(h.calls.chats.length, 2);
 });
 
@@ -701,7 +701,7 @@ test('YouTubeのquotaExceededでは次の日までAPIを止める', () => {
 
 test('Xの初期設定は有効化しても1日1回で、翌日までアップロードしない', () => {
   const h = harness({ properties: { X_DAILY_POST_BUDGET: undefined, X_31DAY_POST_BUDGET: undefined },
-    geminiResponses: [geminiResponse('一日目の桑'), geminiResponse('二日目の桑'), geminiResponse('次の日の桑')] });
+    geminiResponses: [geminiResponse('ぼく、一日目の桑が楽しみ'), geminiResponse('ぼく、二日目の桑が楽しみ'), geminiResponse('ぼく、次の日の桑が楽しみ')] });
   h.run(); h.advance(30 * 60000); h.refreshImage(); h.run();
   assert.equal(h.calls.uploads.length, 1);
   h.advance(24 * 3600000); h.refreshImage(); h.run();
@@ -724,7 +724,7 @@ test('Xのレート残量・resetヘッダーに合わせて次の試行を遅�
   const now = Date.parse('2026-10-07T07:00:00Z');
   const h = harness({ now, tweetResponses: [response(201, { data: { id: 'tweet-1' } }, {
     'x-rate-limit-remaining': '0', 'x-rate-limit-reset': String(now / 1000 + 7200)
-  })], geminiResponses: [geminiResponse('最初の桑'), geminiResponse('次の桑'), geminiResponse('次の次の桑')] });
+  })], geminiResponses: [geminiResponse('ぼく、最初の桑が楽しみ'), geminiResponse('ぼく、次の桑が楽しみ'), geminiResponse('ぼく、次のぼく、次の桑が楽しみが楽しみ')] });
   h.run(); h.advance(30 * 60000); h.refreshImage(); h.run();
   assert.equal(h.calls.uploads.length, 1);
   h.advance(92 * 60000); h.refreshImage(); h.run();
@@ -1417,8 +1417,8 @@ test('学校と個人の自動実行はそれぞれ1時間で作成する', () =
 
 test('同じ写真でも1時間後に新しい実況を解析・記録して個人側から1回だけ投稿する', () => {
   const school = preparedSchool({ properties: VARIATION_PROPERTIES, geminiResponses: [
-    geminiResponse('白い体が並んで、今日はここが特等席。'),
-    geminiResponse('この葉っぱの模様、みんなには何に見える？')
+    geminiResponse('ぼく、ここが特等席で落ち着くな。'),
+    geminiResponse('ぼく、この葉っぱの模様が気になってわくわくするよ。')
   ] });
   assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
   const first = school.state();
@@ -1451,9 +1451,9 @@ test('同じ写真でも1時間後に新しい実況を解析・記録して個�
 });
 
 test('完全一致・ほぼ同じ語句の実況は追加API呼出しなしで見送る', () => {
-  const original = '白い体が並んで、今日はここが特等席。';
+  const original = 'ぼく、ここが特等席で落ち着くな。';
   const school = preparedSchool({ properties: VARIATION_PROPERTIES, geminiResponses: [
-    geminiResponse(original), geminiResponse(original + '！'), geminiResponse('白い体が並んで、今日はここも特等席。')
+    geminiResponse(original), geminiResponse(original + '！'), geminiResponse('ぼく、ここも特等席で落ち着くな。')
   ] });
   school.context.analyzeLatestImageAndLog();
   const state = school.values.YOSAN_STATE_V1;
@@ -1545,7 +1545,7 @@ test('新しい実況でも手動投稿は60分間隔を守る', () => {
   school.context.analyzeLatestImageAndLog();
   const personal = personalWithPrepared(school);
   assert.equal(personal.context.postPreparedCommentToYouTube().youtube, 'sent');
-  const state = personal.state(); state.youtube = 'pending'; state.feeling = 'この場所からみんなの配信を見守っているよ。';
+  const state = personal.state(); state.youtube = 'pending'; state.feeling = 'ぼく、みんなと一緒にのんびり過ごしたいな。';
   personal.values.YOSAN_STATE_V1 = JSON.stringify(state);
   personal.advance(59 * 60000);
   assert.equal(personal.context.postPreparedCommentToYouTube().status, 'rate_limited');
@@ -1720,7 +1720,7 @@ test('名前を変えても同じ本文の再投稿を防ぐ', () => {
 test('学校が新しい本文を用意したら次の名前で投稿しGeminiを追加で呼ばない', () => {
   const school = preparedSchool({ properties: { ...VARIATION_PROPERTIES, ...NAMED_PROPERTIES }, geminiResponses: [
     geminiResponse('白い体が並んで、ここがぼくの特等席。'),
-    geminiResponse('この葉っぱの模様、みんなは何に見える？')
+    geminiResponse('ぼく、この葉っぱの模様が気になってわくわくするよ。')
   ] });
   school.context.analyzeLatestImageAndLog();
   const h = personalWithPrepared(school);
@@ -1855,7 +1855,7 @@ test('飼育環境読取りは初期有効で同じ1回のAPIからUIと気持�
   assert.equal(h.state().rearing.humidityPercent, 79);
   assert.equal(h.state().rearing.reference.temperatureC, 29);
   assert.equal(h.state().rearing.reference.humidityPercent, 75);
-  assert.equal(h.state().analysisVersion, 'rearing-v1');
+  assert.equal(h.state().analysisVersion, 'rearing-first-person-v2');
 });
 
 test('1から5令の温度目安はUIの令に対応し4令の湿度を補わない', () => {
@@ -1894,12 +1894,12 @@ test('目安に近い湿度でジメジメや湿っぽいとする本文を見�
 
 test('温度と湿度が近い目安から少し違っても捏造せず中立の気持ちを準備する', () => {
   const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
-    careResponse('1令3日目、葉っぱのそばでひと休み気分。')
+    careResponse('ぼく、1令3日目は葉っぱのそばでひと休み気分。')
   ] });
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.state().rearing.temperatureC, 28);
   assert.equal(h.state().rearing.humidityPercent, 79);
-  assert.equal(h.state().feeling, '1令3日目、葉っぱのそばでひと休み気分。');
+  assert.equal(h.state().feeling, 'ぼく、1令3日目は葉っぱのそばでひと休み気分。');
   assert.equal(h.calls.logs.length, 1);
 });
 
@@ -1909,7 +1909,7 @@ test('危険域の温度を快適とする本文は見送り高温への心配�
   ] });
   assert.equal(bad.context.analyzeLatestImageAndLog().status, 'care_mismatch');
   const good = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
-    careResponse('画面は35℃、暑さが心配だな。', { temperatureText: '35℃' })
+    careResponse('ぼく、35℃の暑さが心配だな。', { temperatureText: '35℃' })
   ] });
   assert.equal(good.context.analyzeLatestImageAndLog().status, 'prepared');
 });
@@ -1920,7 +1920,7 @@ test('目安の範囲が不明な段階では快適と断定せず知らない�
   ] });
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'care_mismatch');
   const neutral = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
-    careResponse('ここでのんびり過ごしたい気分。', { stageText: null, temperatureText: null, humidityText: null })
+    careResponse('ぼく、ここでのんびり過ごしたい気分。', { stageText: null, temperatureText: null, humidityText: null })
   ] });
   assert.equal(neutral.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(neutral.state().rearing.instar, null);
@@ -1965,7 +1965,7 @@ test('眠中は食べている描写を見送り営繭中の目安は23℃60％�
   ] });
   assert.equal(sleeping.context.analyzeLatestImageAndLog().status, 'care_mismatch');
   const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
-    careResponse('繭の準備に集中したい気分。', { stageText: '5令8日目 営繭', temperatureText: '23℃', humidityText: '60%' })
+    careResponse('ぼく、繭の準備に集中したい気分。', { stageText: '5令8日目 営繭', temperatureText: '23℃', humidityText: '60%' })
   ] });
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.state().rearing.phase, 'spinning');
@@ -1995,7 +1995,7 @@ test('解析JSONが壊れている場合は本文だけを採用して投稿し�
 
 test('新解析形式では古いプレビューを再利用せず新しいUI情報を保存する', () => {
   const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_REARING_CONTEXT: 'false' }, geminiResponses: [
-    geminiResponse('暑いなあ。'), careResponse()
+    geminiResponse('ぼく、暑くてつらいなあ。'), careResponse()
   ] });
   h.context.previewSchoolAnalysis();
   assert.equal(h.calls.gemini.length, 1);
@@ -2003,7 +2003,7 @@ test('新解析形式では古いプレビューを再利用せず新しいUI情
   h.advance(3600000);
   assert.equal(h.context.previewSchoolAnalysis().status, 'preview');
   assert.equal(h.calls.gemini.length, 2);
-  assert.equal(JSON.parse(h.values.YOSAN_PREVIEW_V1).analysisVersion, 'rearing-v1');
+  assert.equal(JSON.parse(h.values.YOSAN_PREVIEW_V1).analysisVersion, 'rearing-first-person-v2');
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.calls.gemini.length, 2);
   assert.equal(h.state().rearing.instarDay, 3);
@@ -2069,12 +2069,142 @@ test('一括処理の初期有効モードもUIを読み日付名前付き本文
   const h = harness({ properties: { ENABLE_REARING_CONTEXT: undefined, ENABLE_NAMED_COMMENTS: 'true' },
     geminiResponses: [careResponse()] });
   assert.equal(h.run().youtube, 'sent');
-  assert.equal(h.state().analysisVersion, 'rearing-v1');
+  assert.equal(h.state().analysisVersion, 'rearing-first-person-v2');
   assert.equal(h.state().rearing.instar, 1);
   assert.equal(h.state().rearing.reference.temperatureC, 29);
   assert.ok(h.calls.chats[0].payload.snippet.textMessageDetails.messageText.includes('\nこはく：'));
   assert.equal(h.calls.gemini.length, 1);
   assert.equal(h.run().youtube, 'sent');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('蚕本人の一人称と心の声は語順や呼び方を変えて採用できる', () => {
+  const h = preparedSchool();
+  for (const text of [
+    '葉っぱのそばなら、ぼくものんびりできるな。',
+    'わたし、みんなと一緒でちょっとうれしいな。',
+    '僕はここがお気に入りだよ。',
+    '私もちょっとひと休みしたいな。',
+    'ぼくら、仲間といっしょで安心するよ。',
+    'ボク、次のごはんが楽しみだな。',
+    'ぼく、今日はなんだかむずむず。'
+  ]) h.context.validateSilkwormVoice_(text);
+});
+
+test('観察者やAIの解説は一人称を付けただけでも見送る', () => {
+  const h = preparedSchool();
+  for (const text of [
+    '蚕たちは元気に育っています。',
+    '葉っぱの上でみんなが食べているように見えます。',
+    'ぼく、蚕たちが元気そうでうれしいな。',
+    'ぼくは観察者として蚕の様子を伝えたいな。',
+    'わたしはAIとして蚕の気持ちを解説したいな。',
+    '「ぼくはうれしい」と蚕が言っています。',
+    'ぼく、温度28℃、湿度79%だよ。',
+    'ぼく、温度28℃、湿度79%だな。'
+  ]) assert.throws(() => h.context.validateSilkwormVoice_(text), e => e.botStatus === 'voice_mismatch');
+});
+
+test('観察者目線のAI回答は投稿とシート保存をせず履歴にも採用しない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('蚕たちは元気に育っています。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.values.YOSAN_STATE_V1, undefined);
+  assert.equal(h.values.YOSAN_FEELING_HISTORY_V1, undefined);
+  const prompt = JSON.parse(h.calls.gemini[0].request.payload).systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('一人称'));
+  assert.ok(prompt.includes('本人の好み'));
+  assert.ok(prompt.includes('観察者・解説者'));
+});
+
+test('旧互換モードでも一人称でない回答を投稿しない', () => {
+  const h = harness({ geminiResponses: [geminiResponse('蚕は元気そうですね。')] });
+  assert.equal(h.run().status, 'voice_mismatch');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.uploads.length, 0);
+});
+
+test('本人の気持ちを日付と名前コロンで投稿する', () => {
+  const school = preparedSchool({ now: Date.parse('2026-11-05T12:00:00Z'), properties: CARE_PROPERTIES,
+    geminiResponses: [careResponse('葉っぱのそばなら、ぼくものんびりできるな。')] });
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
+  const h = personalWithPrepared(school, { now: school.now() });
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText,
+    '2026/11/05\nこはく：葉っぱのそばなら、ぼくものんびりできるな。');
+});
+
+test('個人側は保存済み本文を変更された場合も観察者文を送信しない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const state = h.state(); state.feeling = '蚕たちは元気に食べています。';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'voice_mismatch');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.state().youtube, 'pending');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+});
+
+test('直接の投稿関数でも観察者文をAPI呼出し前に止める', () => {
+  const h = harness();
+  assert.throws(() => h.context.postLatestCommentToYouTube('蚕たちは元気です。', 'chat-1', h.context.getConfig_()),
+    e => e.botStatus === 'voice_mismatch');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.values.YOSAN_LIMITS_V1, undefined);
+});
+
+test('不適合な本文の表示プレビューも状態を変えず待機する', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school); delete h.context.YouTube;
+  const state = h.state(); state.feeling = '画面では蚕が食べています。';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  const before = JSON.stringify(h.values);
+  assert.equal(h.context.previewPreparedComment().status, 'voice_mismatch');
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('一人称検査前の旧解析文は投稿せず新しい学校側の解析を待つ', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const state = h.state(); state.feeling = '蚕たちは元気です。'; state.analysisVersion = 'rearing-v1';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'waiting_analysis');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.videos.length, 0);
+});
+
+test('気持ちを表せない画像の空本文は観察報告に置き換えず見送る', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('', {
+    stageText: null, temperatureText: null, humidityText: null
+  })] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('70文字への切詰めで一人称と気持ちが消えた文は採用しない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('葉'.repeat(75) + 'ぼくはのんびり気分。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('旧互換モードの一人称版への移行でもunknownを解除せず新旧画像とも待機する', () => {
+  const h = harness(); h.run();
+  const state = h.state(); state.youtube = 'unknown'; state.analysisVersion = 'before-first-person';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  h.advance(3600000);
+  assert.equal(h.run().status, 'unknown');
+  h.refreshImage();
+  assert.equal(h.run().status, 'unknown');
+  assert.equal(h.state().youtube, 'unknown');
   assert.equal(h.calls.gemini.length, 1);
   assert.equal(h.calls.chats.length, 1);
 });
