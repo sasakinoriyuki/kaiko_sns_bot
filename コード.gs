@@ -658,10 +658,11 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
     config.rearingObservation = result.observation;
     console.log('画像UIの読取り: ' + JSON.stringify(result.observation));
     validateRearingFeeling_(result.feeling, result.observation);
-    feeling = shortenText_(result.feeling, MAX_FEELING_CHARS);
+    feeling = normalizeSilkwormFeeling_(result.feeling);
   } else {
-    feeling = shortenText_(text, MAX_FEELING_CHARS);
+    feeling = normalizeSilkwormFeeling_(text);
   }
+  feeling = shortenText_(feeling, MAX_FEELING_CHARS);
   validateSilkwormVoice_(feeling);
   if (config.varyFeelings) {
     if (history.some(function (previous) { return similarFeelings_(feeling, previous); })) {
@@ -755,6 +756,7 @@ function getLiveDetails_(ids, channelId, config) {
   const response = youtubeCall_(config, 1, function () {
     return YouTube.Videos.list('snippet,liveStreamingDetails', { id: ids.join(',') });
   });
+  if (config.videoId && ids.length === 1 && ids[0] === config.videoId) logConfiguredVideoStatus_(response, config);
   const active = (response.items || []).filter(function (item) {
     const details = item.liveStreamingDetails;
     return item.snippet && (!channelId || item.snippet.channelId === channelId) && details &&
@@ -1060,7 +1062,7 @@ function configureSplitAccountMode() {
   properties.setProperty('SPLIT_ACCOUNT_MODE', 'true');
   properties.setProperty('ENABLE_X', 'false');
   properties.setProperty('ENABLE_INSTAGRAM', 'false');
-  if (!properties.getProperty('YOUTUBE_VIDEO_ID')) properties.setProperty('YOUTUBE_VIDEO_ID', 'J1XMapSSHeI');
+  console.log('投稿先は現在の配信のYOUTUBE_VIDEO_IDを設定するか、CHANNEL_IDによる自動検出を使ってください。');
   console.log('学校はanalyzeLatestImageAndLog、個人はpostPreparedCommentToYouTubeを使ってください。');
 }
 
@@ -1256,6 +1258,8 @@ function diagnosePersonalYouTube() {
   let stage = '設定の読込';
   try {
     const config = getYouTubeOnlyConfig_();
+    console.log(config.videoId ? '投稿先の指定: YOUTUBE_VIDEO_ID=' + config.videoId :
+      '投稿先の指定: チャンネル自動検出' + (/^UC[A-Za-z0-9_-]{22}$/.test(config.channelId) ? '（' + config.channelId + '）' : ''));
     const properties = PropertiesService.getScriptProperties();
     stage = '解析済みデータの読込';
     const state = readJsonProperty_(properties, BOT_STATE_KEY);
@@ -1585,17 +1589,83 @@ function silkwormVoicePrompt_() {
     'これは蚕の気持ちを擬人化した想像であり、実際の感情・健康状態の診断ではない。';
 }
 
-function silkwormVoiceMismatch_() {
-  const error = waitError_('蚕本人の一人称の気持ちになっていないため、投稿せず次の解析を待ちます。');
+function silkwormVoiceMismatch_(reason, feeling) {
+  const descriptions = {
+    empty_body: '本文が空',
+    observer_language: '観察者・解説者の表現',
+    missing_feeling: '気持ち・願望・感覚の表現がない',
+    missing_first_person: '一人称がない',
+    ambiguous_subject: '他者への言及があり一人称を補えない',
+    prefix_too_long: '一人称を補うと70文字を超える'
+  };
+  reason = reason || 'unknown';
+  const candidate = typeof feeling === 'string' ? shortenText_(feeling.replace(/\s+/g, ' '), MAX_FEELING_CHARS) : '';
+  console.log('一人称チェック不採用 [' + reason + ']: ' + JSON.stringify(candidate));
+  const error = waitError_('蚕本人の一人称の気持ちになっていないため、投稿せず次の解析を待ちます。理由: ' +
+    (descriptions[reason] || '形式を確認'));
   error.botStatus = 'voice_mismatch';
+  error.voiceReason = reason;
   return error;
 }
 
-function validateSilkwormVoice_(feeling) {
-  if (typeof feeling !== 'string' || !feeling.trim()) throw silkwormVoiceMismatch_();
+function silkwormVoiceIssue_(feeling) {
+  if (typeof feeling !== 'string' || !feeling.trim()) return 'empty_body';
   const text = feeling.normalize('NFKC');
-  const firstPerson = /(ぼく|ボク|僕|わたし|ワタシ|私)/;
-  const observer = /(?:蚕|カイコ|かいこ)(?:たち|達|さん|ちゃん|は|が|を|の様子|の気持ち)|お蚕|画像|写真|画面|映像|カメラ|実況|解説|解析|観察|見守|見え|見られ|見受け|元気そう|ように見|と言って|と話して|(?:飼育者|飼育員|視聴者)として|\bAI\b|人工知能|アシスタント/i;
-  const feelingWords = /気分|気持ち|たい|ほしい|欲しい|うれし|嬉し|楽し|たのし|好き|すき|落ち着|ほっと|安心|心配|不安|のんびり|ゆっくり|ひと休み|一休み|わくわく|ワクワク|どきどき|ドキドキ|おいし|美味|幸せ|しあわせ|眠い|ねむ|満足|まんぞく|まったり|そわそわ|ソワソワ|むずむず|ムズムズ|うとうと|ウトウト|うきうき|ウキウキ|のびのび|気楽|心地|居心地|リラックス|最高|がんば|頑張|やる気|元気|くつろ|ほっこり|特等席|お気に入り|いいな|気になる|気になっ|気に入|いこう|しておこう|どうしよう|よかった|つら|辛|苦し|おなかいっぱい|お腹いっぱい/;
-  if (!firstPerson.test(text) || observer.test(text) || !feelingWords.test(text)) throw silkwormVoiceMismatch_();
+  const firstPerson = /(ぼく|ボク|僕|わたし|ワタシ|私|わたくし|あたし|アタシ|おいら|オイラ|おれ|オレ|俺)/;
+  const observer = /(?:蚕|カイコ|かいこ)(?:たち|達|さん|ちゃん|は|が|を|の様子|の気持ち)|お蚕|画像|写真|画面|映像|カメラ|実況|解説|解析|観察|見守|見え|見られ|見受け|元気そう|楽しそう|嬉しそう|うれしそう|眠そう|ねむそう|幸せそう|ように見|と言って|と話して|(?:飼育者|飼育員|視聴者)として|\bAI\b|人工知能|アシスタント/i;
+  const feelingWords = /気分|気持ち|たい|ほしい|欲しい|うれし|嬉し|楽し|たのし|好き|すき|落ち着|ほっと|安心|心配|不安|のんびり|ゆっくり|ひと休み|一休み|わくわく|ワクワク|どきどき|ドキドキ|おいし|美味|幸せ|しあわせ|眠い|ねむ|満足|まんぞく|まったり|そわそわ|ソワソワ|むずむず|ムズムズ|うとうと|ウトウト|うきうき|ウキウキ|のびのび|気楽|心地|居心地|リラックス|最高|がんば|頑張|やる気|元気|くつろ|ほっこり|特等席|お気に入り|いいな|気になる|気になっ|気に入|いこう|しておこう|どうしよう|よかった|つら|辛|苦し|暑い|暑く|寒い|寒く|冷え|熱い|眩し|まぶしい|だる|疲れ|つかれ|お(?:腹|なか)(?:が)?(?:すい|空)|おなかいっぱい|お腹いっぱい/;
+  if (observer.test(text)) return 'observer_language';
+  if (!feelingWords.test(text)) return 'missing_feeling';
+  if (!firstPerson.test(text)) return 'missing_first_person';
+  return null;
+}
+
+function validateSilkwormVoice_(feeling) {
+  const issue = silkwormVoiceIssue_(feeling);
+  if (issue) throw silkwormVoiceMismatch_(issue, feeling);
+}
+
+/** 明らかな主観の心の声で、一人称だけが省略された場合に限定して補う。 */
+function normalizeSilkwormFeeling_(feeling) {
+  const text = typeof feeling === 'string' ? feeling.replace(/\s+/g, ' ').trim() : feeling;
+  const issue = silkwormVoiceIssue_(text);
+  if (issue === 'missing_first_person') {
+    if (/(?:蚕|カイコ|かいこ|あなた|きみ|君|皆さん|みなさん|彼ら|彼女|飼育者|飼育員|視聴者|誰か|(?:みんな|仲間)(?:が|は|も))/.test(text)) {
+      throw silkwormVoiceMismatch_('ambiguous_subject', text);
+    }
+    const normalized = 'ぼく、' + text;
+    if (Array.from(normalized).length > MAX_FEELING_CHARS) throw silkwormVoiceMismatch_('prefix_too_long', text);
+    validateSilkwormVoice_(normalized);
+    console.log('一人称を補いました: ' + JSON.stringify(shortenText_(normalized, MAX_FEELING_CHARS)));
+    return normalized;
+  }
+  validateSilkwormVoice_(text);
+  return text;
+}
+
+/** 既存のVideos.list応答だけを使い、追加のAPI呼出しなしで理由を表示する。 */
+function logConfiguredVideoStatus_(response, config) {
+  const item = (response.items || []).find(function (video) { return video.id === config.videoId; });
+  const details = item && item.liveStreamingDetails;
+  let status, action;
+  if (!item) {
+    status = '動画を取得できません';
+    action = '動画ID・公開範囲・個人アカウントで視聴できるかを確認してください。';
+  } else if (details && details.actualEndTime) {
+    status = '配信終了済み';
+    action = '現在配信中のURLのv=の後ろ11文字をYOUTUBE_VIDEO_IDへ登録してください。';
+  } else if (!details) {
+    status = 'ライブ配信情報なし';
+    action = '通常動画ではなく、現在配信中の動画IDか確認してください。';
+  } else if (!details.actualStartTime) {
+    status = '配信開始を確認できません';
+    action = '配信前またはAPI反映待ちです。実際の配信状態を確認してください。';
+  } else if (!details.activeLiveChatId) {
+    status = '配信開始済み・チャットIDなし';
+    action = 'ライブチャットの有効化・配信設定・個人アカウントのアクセス権を確認してください。';
+  } else {
+    status = '配信中・チャットID取得済み';
+    action = '';
+  }
+  console.log('指定動画 ' + config.videoId + ': ' + status + (action ? '。' + action : ''));
 }

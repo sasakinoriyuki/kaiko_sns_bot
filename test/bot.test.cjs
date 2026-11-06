@@ -1290,14 +1290,14 @@ test('アカウント別のトリガー作成で不要な権限を要求しな�
   assert.deepEqual(personal.triggers.map(t => t.getHandlerFunction()), ['otherHandler', 'postPreparedCommentToYouTube']);
 });
 
-test('分担設定はキー・予算・既存の投稿状態を維持して動画IDを設定する', () => {
+test('分担設定はキー・予算・既存の投稿状態を維持し動画IDを自動登録しない', () => {
   const h = harness(); h.run();
   const state = h.values.YOSAN_STATE_V1, limits = h.values.YOSAN_LIMITS_V1;
   h.context.configureSplitAccountMode();
   assert.equal(h.values.SPLIT_ACCOUNT_MODE, 'true');
   assert.equal(h.values.ENABLE_X, 'false');
   assert.equal(h.values.ENABLE_INSTAGRAM, 'false');
-  assert.equal(h.values.YOUTUBE_VIDEO_ID, 'J1XMapSSHeI');
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, undefined);
   assert.equal(h.values.GEMINI_API_KEY, 'test-gemini-key');
   assert.equal(h.values.YOSAN_STATE_V1, state);
   assert.equal(h.values.YOSAN_LIMITS_V1, limits);
@@ -2207,4 +2207,107 @@ test('旧互換モードの一人称版への移行でもunknownを解除せず�
   assert.equal(h.state().youtube, 'unknown');
   assert.equal(h.calls.gemini.length, 1);
   assert.equal(h.calls.chats.length, 1);
+});
+
+test('一人称が省略された明らかな心の声だけを補い同じ1回のAI応答で準備する', () => {
+  const school = preparedSchool({ now: Date.parse('2026-11-06T05:30:00Z'), properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('葉っぱのそばでのんびりしたいな。', { stageText: '2齢（5日目）', temperatureText: '26.0 ℃', humidityText: '84.5 %' })
+  ] });
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(school.state().feeling, 'ぼく、葉っぱのそばでのんびりしたいな。');
+  assert.equal(school.state().rearing.instar, 2);
+  assert.equal(school.calls.gemini.length, 1);
+  assert.ok(school.calls.console.some(line => line.includes('一人称を補いました:')));
+  const h = personalWithPrepared(school, { now: school.now() });
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText,
+    '2026/11/06\nこはく：ぼく、葉っぱのそばでのんびりしたいな。');
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('観察者文や数字だけの文は一人称を機械的に付けて通さない', () => {
+  const h = preparedSchool();
+  for (const [text, reason] of [
+    ['蚕たちは元気そうですね。', 'observer_language'],
+    ['のんびり楽しそうだね。', 'observer_language'],
+    ['温度26℃、湿度84.5%です。', 'missing_feeling'],
+    ['仲間が元気で安心だな。', 'ambiguous_subject']
+  ]) assert.throws(() => h.context.normalizeSilkwormFeeling_(text), e => e.botStatus === 'voice_mismatch' && e.voiceReason === reason);
+});
+
+test('不採用ログには原因コードと候補文が残り投稿状態は作らない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('蚕たちは元気そうですね。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  const detail = h.calls.console.find(line => line.includes('一人称チェック不採用 [observer_language]'));
+  assert.ok(detail);
+  assert.ok(detail.includes('蚕たちは元気そうですね。'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.values.YOSAN_STATE_V1, undefined);
+});
+
+test('本人の感覚と別の自然な一人称も受け入れる', () => {
+  const h = preparedSchool();
+  for (const text of ['ぼく、おなかすいたな。', 'おいら、次のごはんが楽しみだよ。', 'あたし、ここが好き。', 'ぼく、まぶしいな。']) {
+    assert.equal(h.context.normalizeSilkwormFeeling_(text), text);
+  }
+});
+
+test('一人称の補完で文字数を超える場合は文を壊さず見送る', () => {
+  const h = preparedSchool();
+  assert.throws(() => h.context.normalizeSilkwormFeeling_('葉'.repeat(64) + 'が好きだな。'),
+    e => e.voiceReason === 'prefix_too_long');
+  const short = h.context.normalizeSilkwormFeeling_('葉'.repeat(60) + 'が好きだな。');
+  assert.ok(Array.from(short).length <= 70);
+  assert.ok(short.startsWith('ぼく、'));
+});
+
+test('更新した分担設定は登録済み動画IDを維持する', () => {
+  const h = harness({ properties: { YOUTUBE_VIDEO_ID: 'new_video01' } });
+  h.context.configureSplitAccountMode();
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, 'new_video01');
+});
+
+test('指定動画の不一致理由は追加APIなしで配信終了等を区別する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const cases = [
+    [undefined, '動画を取得できません'],
+    [null, 'ライブ配信情報なし'],
+    [{ scheduledStartTime: '2030-01-01T00:00:00Z' }, '配信開始を確認できません'],
+    [{ actualStartTime: '2026-11-06T00:00:00Z', actualEndTime: '2026-11-06T01:00:00Z' }, '配信終了済み'],
+    [{ actualStartTime: '2026-11-06T00:00:00Z' }, '配信開始済み・チャットIDなし']
+  ];
+  for (const [details, expected] of cases) {
+    const h = personalWithPrepared(school);
+    h.setVideos(details === undefined ? [] : [h.liveVideo({ id: 'J1XMapSSHeI', liveStreamingDetails: details })]);
+    assert.equal(h.context.previewYouTubeConnection().status, 'no_live');
+    assert.ok(h.calls.console.some(line => line.includes(expected)));
+    assert.equal(h.calls.videos.length, 1);
+    assert.equal(h.calls.channels, 0);
+    assert.equal(h.calls.searches.length, 0);
+    assert.equal(h.calls.chats.length, 0);
+  }
+});
+
+test('接続済みの表示も読取りAPI1回だけで投稿しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const before = h.values.YOSAN_STATE_V1;
+  assert.equal(h.context.previewYouTubeConnection().status, 'ready');
+  assert.ok(h.calls.console.some(line => line.includes('配信中・チャットID取得済み')));
+  assert.equal(h.calls.videos.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.values.YOSAN_STATE_V1, before);
+});
+
+test('個人側診断で確認中の動画IDを表示するが投稿先を変更しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { properties: { YOUTUBE_VIDEO_ID: 'new_video01' } });
+  h.setVideos([h.liveVideo({ id: 'new_video01' })]);
+  assert.equal(h.context.diagnosePersonalYouTube().status, 'diagnosed');
+  assert.ok(h.calls.console.some(line => line.includes('投稿先の指定: YOUTUBE_VIDEO_ID=new_video01')));
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, 'new_video01');
+  assert.equal(h.calls.videos.length, 1);
+  assert.equal(h.calls.channels, 1);
+  assert.equal(h.calls.chats.length, 0);
 });
