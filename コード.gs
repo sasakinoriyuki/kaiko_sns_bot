@@ -709,17 +709,23 @@ function asSheetText_(text) {
 
 /** 配信中IDを再利用し、必ずVideos.listで現在も配信中か確認する。 */
 function findActiveLive_(config) {
-  if (config.videoId) return getLiveDetails_([config.videoId], null, config);
+  if (config.videoId) {
+    console.log('配信検出: 固定動画 ' + config.videoId);
+    return getLiveDetails_([config.videoId], null, config);
+  }
+  if (!/^UC[A-Za-z0-9_-]{22}$/.test(config.channelId)) {
+    throw new Error('CHANNEL_IDには配信しているチャンネルのID（UCで始まる24文字）を設定してください。');
+  }
+  console.log('配信検出: チャンネル自動検出 ' + config.channelId);
   const properties = PropertiesService.getScriptProperties();
   const videoKey = 'YOSAN_LIVE_VIDEO_' + config.channelId;
-  // 配信所有者として実行している場合、検索より軽いliveBroadcasts.listを使う。
   const channels = youtubeCall_(config, 1, function () {
     return YouTube.Channels.list('id', { mine: true, maxResults: 50 });
   });
-  let ids;
+  const ownsChannel = (channels.items || []).some(function (channel) { return channel.id === config.channelId; });
+  let ids = [];
   let cachedLive = null;
-  if ((channels.items || []).some(function (channel) { return channel.id === config.channelId; })) {
-    // 複数同時配信にも対応するため、所有者では毎回最新の一覧を確認する。
+  if (ownsChannel) {
     const broadcasts = youtubeCall_(config, 1, function () {
       return YouTube.LiveBroadcasts.list('snippet', {
         broadcastStatus: 'active', broadcastType: 'all', maxResults: 50
@@ -728,6 +734,7 @@ function findActiveLive_(config) {
     ids = (broadcasts.items || []).filter(function (item) {
       return item.snippet && item.snippet.channelId === config.channelId;
     }).map(function (item) { return item.id; });
+    console.log('所有者の配信一覧: 対象チャンネルの候補 ' + ids.length + '件');
   } else {
     const cachedId = properties.getProperty(videoKey);
     if (cachedId) {
@@ -736,21 +743,68 @@ function findActiveLive_(config) {
     }
     const searchKey = 'YOSAN_LAST_SEARCH_' + config.channelId;
     const lastSearch = Number(properties.getProperty(searchKey) || 0);
-    if (Date.now() - lastSearch < config.searchIntervalMinutes * 60000) return cachedLive;
-    // 失敗した検索もクォータを消費し得るので、実行前に時刻を保存する。
-    properties.setProperty(searchKey, String(Date.now()));
-    const search = youtubeCall_(config, 100, function () {
-      return YouTube.Search.list('id', {
-        channelId: config.channelId, eventType: 'live', type: 'video', order: 'date', maxResults: 50
+    const nextSearch = lastSearch + config.searchIntervalMinutes * 60000;
+    if (Date.now() < nextSearch) {
+      console.log('ライブ検索待ち: 次の検索まで約' + Math.ceil((nextSearch - Date.now()) / 60000) +
+        '分（日本時間 ' + Utilities.formatDate(new Date(nextSearch), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + '以降）。');
+    } else {
+      // 失敗した検索も消費し得るので実行前に時刻を保存する。BOT側は従来の保守的な100単位で予約。
+      properties.setProperty(searchKey, String(Date.now()));
+      const search = youtubeCall_(config, 100, function () {
+        return YouTube.Search.list('snippet', {
+          channelId: config.channelId, eventType: 'live', type: 'video', order: 'date', maxResults: 50
+        });
       });
-    });
-    ids = (search.items || []).filter(function (item) { return item.id && item.id.videoId; })
-      .map(function (item) { return item.id.videoId; });
+      ids = (search.items || []).filter(function (item) { return item.id && item.id.videoId; })
+        .map(function (item) { return item.id.videoId; });
+      console.log('ライブ検索結果: 動画候補 ' + ids.length + '件');
+    }
   }
-  const active = (ids.length ? getLiveDetails_(ids, config.channelId, config) : null) || cachedLive;
+  let active = (ids.length ? getLiveDetails_(ids, config.channelId, config) : null) || cachedLive;
+  // 検索に未反映の公開ライブを補う。キャッシュも検索も配信中を返さない場合だけ、直近50件を確認。
+  if (!active && !ownsChannel) active = findLiveInRecentUploads_(config);
   if (active) properties.setProperty(videoKey, active.videoId);
-  else properties.deleteProperty(videoKey);
+  else {
+    properties.deleteProperty(videoKey);
+    console.log('自動検出: 配信中の動画を取得できませんでした。対象チャンネル・公開範囲・配信状態を確認してください。');
+  }
   return active;
+}
+
+/** 検索に依存せず、APIで取得した対象チャンネルの動画一覧を最大50件確認する。 */
+function findLiveInRecentUploads_(config) {
+  const response = youtubeCall_(config, 1, function () {
+    return YouTube.Channels.list('snippet,contentDetails', { id: config.channelId });
+  });
+  const channel = (response.items || []).find(function (item) { return item.id === config.channelId; });
+  if (!channel) {
+    console.log('対象チャンネルを取得できません。CHANNEL_IDが配信しているチャンネルのIDか確認してください。');
+    return null;
+  }
+  const title = channel.snippet && channel.snippet.title;
+  if (typeof title === 'string') console.log('対象チャンネル名: ' + JSON.stringify(shortenText_(title.replace(/\s+/g, ' '), 80)));
+  const uploads = channel.contentDetails && channel.contentDetails.relatedPlaylists && channel.contentDetails.relatedPlaylists.uploads;
+  if (!uploads) {
+    console.log('対象チャンネルの動画一覧IDを取得できません。公開範囲・アクセス権を確認してください。');
+    return null;
+  }
+  let playlist;
+  try {
+    playlist = youtubeCall_(config, 1, function () {
+      return YouTube.PlaylistItems.list('contentDetails', { playlistId: uploads, maxResults: 50 });
+    });
+  } catch (error) {
+    if (!error.botWait && /\b(?:playlistNotFound|playlistItemsNotAccessible)\b/i.test(String(error.message || ''))) {
+      console.log('対象チャンネルの動画一覧にアクセスできません。公開範囲・アクセス権を確認してください。');
+      return null;
+    }
+    throw error;
+  }
+  const ids = Array.from(new Set((playlist.items || []).map(function (item) {
+    return item.contentDetails && item.contentDetails.videoId;
+  }).filter(function (id) { return typeof id === 'string' && id; }))).slice(0, 50);
+  console.log('チャンネルの動画一覧: 動画候補 ' + ids.length + '件（直近50件まで）');
+  return ids.length ? getLiveDetails_(ids, config.channelId, config) : null;
 }
 
 function getLiveDetails_(ids, channelId, config) {
@@ -765,6 +819,23 @@ function getLiveDetails_(ids, channelId, config) {
   }).sort(function (a, b) {
     return Date.parse(b.liveStreamingDetails.actualStartTime) - Date.parse(a.liveStreamingDetails.actualStartTime);
   });
+  if (channelId) {
+    console.log('動画候補の確認: 取得' + (response.items || []).length + '件 / 対象チャンネルの配信中' + active.length + '件');
+    if (!active.length && (response.items || []).length) {
+      const counts = { otherChannel: 0, noLiveDetails: 0, notStarted: 0, ended: 0 };
+      (response.items || []).forEach(function (item) {
+        const details = item.liveStreamingDetails;
+        if (!item.snippet || item.snippet.channelId !== channelId) counts.otherChannel++;
+        else if (!details) counts.noLiveDetails++;
+        else if (details.actualEndTime) counts.ended++;
+        else if (!details.actualStartTime) counts.notStarted++;
+      });
+      console.log('候補の内訳: 別チャンネル' + counts.otherChannel + '件 / ライブ情報なし' + counts.noLiveDetails +
+        '件 / 開始未確認' + counts.notStarted + '件 / 終了済み' + counts.ended + '件');
+    }
+    if (active.length) console.log('配信中動画 ' + active[0].id + ': ' +
+      (active[0].liveStreamingDetails.activeLiveChatId ? 'チャットID取得済み' : 'チャットIDなし。配信設定・アクセス権を確認してください。'));
+  }
   if (!active.length) return null;
   return { videoId: active[0].id, liveChatId: active[0].liveStreamingDetails.activeLiveChatId || null };
 }
@@ -1082,6 +1153,37 @@ function configureAutoYouTubeLive() {
   return { status: 'configured', mode: 'auto', channelId: channelId };
 }
 
+/** 個人側で1回実行：指定動画から配信元を確認し、そのチャンネルの自動検出へ切り替える。 */
+function configureAutoYouTubeLiveFromVideo() {
+  requireBotScopes_('youtube', false);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return { status: 'busy' };
+  try {
+    const config = getYouTubeOnlyConfig_();
+    if (!config.videoId) throw new Error('YOUTUBE_VIDEO_IDに確認用の配信動画IDを一度だけ設定してください。');
+    const response = youtubeCall_(config, 1, function () {
+      return YouTube.Videos.list('snippet,liveStreamingDetails', { id: config.videoId });
+    });
+    const video = (response.items || []).find(function (item) { return item.id === config.videoId; });
+    const channelId = video && video.snippet && video.snippet.channelId;
+    if (!channelId || !/^UC[A-Za-z0-9_-]{22}$/.test(channelId)) {
+      throw new Error('指定した動画の配信元を取得できません。動画ID・公開範囲・個人アカウントのアクセス権を確認してください。');
+    }
+    const properties = PropertiesService.getScriptProperties();
+    properties.setProperty('CHANNEL_ID', channelId);
+    properties.deleteProperty('YOUTUBE_VIDEO_ID');
+    const details = video.liveStreamingDetails;
+    if (details && details.actualStartTime && !details.actualEndTime) {
+      properties.setProperty('YOSAN_LIVE_VIDEO_' + channelId, video.id);
+    }
+    console.log('動画 ' + video.id + ' の配信元を確認しました。CHANNEL_ID=' + channelId);
+    console.log('動画固定を解除し、自動検出へ切り替えました。個人側でpreviewYouTubeConnectionを実行してください。');
+    return { status: 'configured', mode: 'auto', channelId: channelId };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /** 学校アカウントで実行：Drive・Gemini・Sheetsのみ。 */
 function analyzeLatestImageAndLog(event) {
   requireBotScopes_('school', false);
@@ -1241,10 +1343,10 @@ function youtubeDiagnostic_(error, stage) {
   }) || (error && error.botWait ? 'BOT_WAIT' : 'UNCLASSIFIED');
   if (/\bYouTube\b.*(?:is not defined|undefined)|Cannot read properties.*(?:LiveChatMessages|insert)/i.test(message)) code = 'YOUTUBE_SERVICE_MISSING';
   if (/^(?:BOTの保存状態|YouTubeの保存状態)/.test(message)) code = 'BOT_STATE_INVALID';
-  if (/^(?:YOUTUBE_|LIVE_SEARCH_)/.test(message)) code = 'CONFIG_INVALID';
+  if (/^(?:CHANNEL_ID|YOUTUBE_|LIVE_SEARCH_)/.test(message)) code = 'CONFIG_INVALID';
   let detail = '理由を特定できませんでした。実行段階と診断結果を確認してください。';
   if (code !== 'UNCLASSIFIED' || /\bAPI call to youtube\./i.test(message) ||
-      /^(?:YOUTUBE_|LIVE_SEARCH_|BOTの保存状態|YouTubeの保存状態|Cannot read properties|.+ is not a function)/.test(message)) {
+      /^(?:CHANNEL_ID|YOUTUBE_|LIVE_SEARCH_|BOTの保存状態|YouTubeの保存状態|Cannot read properties|.+ is not a function)/.test(message)) {
     detail = message
       .replace(/\bBearer\s+[^\s"'<>]+/gi, 'Bearer [TOKEN]')
       .replace(/\bAIza[A-Za-z0-9_-]+\b/g, '[API_KEY]')

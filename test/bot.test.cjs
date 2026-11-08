@@ -21,7 +21,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 function harness(options = {}) {
   let now = options.now ?? Date.now();
   const calls = { triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
-    scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
+    channelRequests: [], playlists: [], scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { ENABLE_REARING_CONTEXT: 'false', GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
     TWITTER_ACCESS_TOKEN: 'test-token', TWITTER_ACCESS_SECRET: 'test-token-secret',
@@ -175,7 +175,19 @@ function harness(options = {}) {
       flush: () => { calls.flushes++; if (remainingFlushFailures-- > 0) throw new Error('flush interrupted'); }
     },
     YouTube: {
-      Channels: { list: () => { calls.channels++; return { items: options.ownsChannel === false ? [] : [{ id: CHANNEL }] }; } },
+      Channels: { list: (part, params) => {
+        calls.channels++; calls.channelRequests.push({ part, params: clone(params) });
+        if (params.id) return { items: options.targetChannel === null ? [] : [options.targetChannel || {
+          id: params.id, snippet: { title: 'テスト配信チャンネル' },
+          ...(options.uploads !== undefined ? { contentDetails: { relatedPlaylists: { uploads: 'uploads-playlist' } } } : {})
+        }] };
+        return { items: options.ownsChannel === false ? [] : [{ id: CHANNEL }] };
+      } },
+      PlaylistItems: { list: (part, params) => {
+        calls.playlists.push({ part, params: clone(params) });
+        if (options.playlistFailure) throw options.playlistFailure;
+        return { items: (options.uploads || []).map(id => ({ contentDetails: { videoId: id } })) };
+      } },
       LiveBroadcasts: { list: (part, params) => {
         calls.broadcasts.push({ part, params: clone(params) });
         return { items: videos };
@@ -183,7 +195,7 @@ function harness(options = {}) {
       Search: { list: (part, params) => {
         calls.searches.push({ part, params: clone(params) });
         if (options.searchFailure) throw options.searchFailure;
-        return { items: videos.map((item) => ({ id: { videoId: item.id } })) };
+        return { items: options.searchItems ?? videos.map((item) => ({ id: { videoId: item.id } })) };
       } },
       Videos: { list: (part, params) => {
         calls.videos.push({ part, params: clone(params) });
@@ -2421,4 +2433,197 @@ test('自動検出の接続プレビューは選んだURLを表示し最新ラ�
   h.setVideos([old, next]);
   assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'no_live');
   assert.equal(h.calls.chats.length, 0);
+});
+
+test('ライブ検索に未反映でもチャンネルの動画一覧から公開ライブを検出する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], uploads: ['new_video01'] });
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([h.liveVideo({ id: 'new_video01' })]);
+  const before = h.values.YOSAN_STATE_V1;
+  assert.equal(h.context.previewYouTubeConnection().videoId, 'new_video01');
+  assert.equal(h.calls.searches[0].part, 'snippet');
+  assert.equal(h.calls.playlists.length, 1);
+  assert.equal(h.calls.playlists[0].params.maxResults, 50);
+  assert.equal(h.calls.playlists[0].params.playlistId, 'uploads-playlist');
+  assert.ok(h.calls.channelRequests.some(call => call.params.id === CHANNEL));
+  assert.ok(h.calls.console.some(line => line.includes('対象チャンネル名: "テスト配信チャンネル"')));
+  assert.equal(h.values.YOSAN_STATE_V1, before);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.values['YOSAN_LIVE_VIDEO_' + CHANNEL], 'new_video01');
+});
+
+test('検索間隔待ちでも取得済みライブがなければ動画一覧から探し検索時刻は維持する', () => {
+  const now = Date.parse('2026-11-08T05:03:00Z');
+  const searchKey = 'YOSAN_LAST_SEARCH_' + CHANNEL;
+  const last = String(now - 3 * 60000);
+  const school = preparedSchool({ now }); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { now, ownsChannel: false, uploads: ['new_video01'], properties: { [searchKey]: last } });
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([h.liveVideo({ id: 'new_video01' })]);
+  assert.equal(h.context.previewYouTubeConnection().status, 'ready');
+  assert.equal(h.calls.searches.length, 0);
+  assert.equal(h.calls.playlists.length, 1);
+  assert.equal(h.values[searchKey], last);
+  assert.ok(h.calls.console.some(line => line.includes('次の検索まで約57分')));
+});
+
+test('動画一覧でも別チャンネルと終了済みと開始前を投稿先にしない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], uploads: ['other_video', 'ended_video', 'next_video1'] });
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([
+    h.liveVideo({ id: 'other_video', snippet: { channelId: 'another-channel' } }),
+    h.liveVideo({ id: 'ended_video', liveStreamingDetails: { actualStartTime: '2026-11-07T01:00:00Z', actualEndTime: '2026-11-07T02:00:00Z' } }),
+    h.liveVideo({ id: 'next_video1', liveStreamingDetails: { scheduledStartTime: '2030-01-01T00:00:00Z' } })
+  ]);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'no_live');
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.values['YOSAN_LIVE_VIDEO_' + CHANNEL], undefined);
+  assert.ok(h.calls.console.some(line => line.includes('対象チャンネルの配信中0件')));
+  assert.ok(h.calls.console.some(line => line.includes('別チャンネル1件') && line.includes('開始未確認1件') && line.includes('終了済み1件')));
+});
+
+test('動画一覧の最新ライブでチャットが無効なら古いチャットへ投稿しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], uploads: ['old_video01', 'new_video01'] });
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([
+    h.liveVideo({ id: 'old_video01', liveStreamingDetails: { actualStartTime: '2026-11-07T01:00:00Z', activeLiveChatId: 'old-chat' } }),
+    h.liveVideo({ id: 'new_video01', liveStreamingDetails: { actualStartTime: '2026-11-08T01:00:00Z' } })
+  ]);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'no_live');
+  assert.equal(h.calls.chats.length, 0);
+  assert.ok(h.calls.console.some(line => line.includes('new_video01: チャットIDなし')));
+});
+
+test('検索待ちとキャッシュの配信中を区別し不要な動画一覧APIを呼ばない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const now = school.now();
+  const h = personalWithPrepared(school, { ownsChannel: false, uploads: ['new_video01'], properties: {
+    ['YOSAN_LAST_SEARCH_' + CHANNEL]: String(now - 60000), ['YOSAN_LIVE_VIDEO_' + CHANNEL]: 'cachedvideo'
+  } });
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([h.liveVideo({ id: 'cachedvideo' })]);
+  assert.equal(h.context.previewYouTubeConnection().videoId, 'cachedvideo');
+  assert.equal(h.calls.searches.length, 0);
+  assert.equal(h.calls.playlists.length, 0);
+  assert.equal(h.calls.channels, 1);
+});
+
+test('対象チャンネルが見つからない場合はログで区別して別チャンネルへ変更しない', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], targetChannel: null });
+  h.context.configureAutoYouTubeLive();
+  const target = h.values.CHANNEL_ID;
+  assert.equal(h.context.previewYouTubeConnection().status, 'no_live');
+  assert.ok(h.calls.console.some(line => line.includes('対象チャンネルを取得できません')));
+  assert.equal(h.values.CHANNEL_ID, target);
+  assert.equal(h.calls.playlists.length, 0);
+});
+
+test('動画一覧にアクセスできない場合は理由を表示し投稿せず待機する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], uploads: ['new_video01'],
+    playlistFailure: new Error('playlistItemsNotAccessible') });
+  h.context.configureAutoYouTubeLive();
+  assert.equal(h.context.previewYouTubeConnection().status, 'no_live');
+  assert.ok(h.calls.console.some(line => line.includes('動画一覧にアクセスできません')));
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('動画一覧APIのクォータエラーは隠さず次の実行も停止する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], uploads: ['new_video01'],
+    playlistFailure: new Error('quotaExceeded') });
+  h.context.configureAutoYouTubeLive();
+  assert.equal(h.context.postPreparedCommentToYouTube().code, 'quotaExceeded');
+  const before = h.calls.channels;
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'rate_limited');
+  assert.equal(h.calls.channels, before);
+  assert.equal(h.calls.playlists.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('不正な自動検出チャンネルIDはAPIを呼ぶ前に設定エラーとして診断する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { properties: { YOUTUBE_VIDEO_ID: undefined, CHANNEL_ID: 'https://www.youtube.com/@example' } });
+  const result = h.context.postPreparedCommentToYouTube();
+  assert.equal(result.code, 'CONFIG_INVALID');
+  assert.equal(h.calls.channels, 0);
+  assert.equal(h.calls.searches.length, 0);
+});
+
+test('確認用の動画から配信元を登録し固定IDを解除してunknownと使用済み予算を保つ', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const channelId = 'UCbbbbbbbbbbbbbbbbbbbbbb';
+  const h = personalWithPrepared(school, { properties: { YOUTUBE_VIDEO_ID: 'new_video01' } });
+  h.setVideos([h.liveVideo({ id: 'new_video01', snippet: { channelId } })]);
+  const state = h.state(); state.youtube = 'unknown';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  const stateBefore = h.values.YOSAN_STATE_V1;
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1);
+  limits.youtube = { day: h.context.quotaDay_(), count: 77, lastPost: h.now() - 60000, nameSequence: 12 };
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  const result = h.context.configureAutoYouTubeLiveFromVideo();
+  assert.equal(result.channelId, channelId);
+  assert.equal(h.values.CHANNEL_ID, channelId);
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, undefined);
+  assert.equal(h.values['YOSAN_LIVE_VIDEO_' + channelId], 'new_video01');
+  assert.equal(h.values.YOSAN_STATE_V1, stateBefore);
+  const after = JSON.parse(h.values.YOSAN_LIMITS_V1);
+  assert.equal(after.youtube.count, 78);
+  assert.equal(after.youtube.nameSequence, 12);
+  assert.equal(after.youtube.lastPost, limits.youtube.lastPost);
+  assert.deepEqual(after.gemini, limits.gemini);
+  assert.equal(h.calls.videos.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('確認用動画が未設定や取得不可なら配信先を変更しない', () => {
+  for (const missing of [true, false]) {
+    const h = harness({ properties: { YOUTUBE_VIDEO_ID: missing ? undefined : 'new_video01', CHANNEL_ID: CHANNEL }, videos: [] });
+    assert.throws(() => h.context.configureAutoYouTubeLiveFromVideo(), /YOUTUBE_VIDEO_ID|配信元を取得できません/);
+    assert.equal(h.values.CHANNEL_ID, CHANNEL);
+    assert.equal(h.values.YOUTUBE_VIDEO_ID, missing ? undefined : 'new_video01');
+    assert.equal(h.calls.chats.length, 0);
+    assert.equal(h.calls.releases, 1);
+  }
+});
+
+test('動画から確認したライブは検索待ちでも初期候補として検証して接続できる', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const channelId = 'UCbbbbbbbbbbbbbbbbbbbbbb';
+  const h = personalWithPrepared(school, { ownsChannel: false, searchItems: [], properties: {
+    YOUTUBE_VIDEO_ID: 'new_video01', ['YOSAN_LAST_SEARCH_' + channelId]: String(school.now())
+  } });
+  h.setVideos([h.liveVideo({ id: 'new_video01', snippet: { channelId } })]);
+  h.context.configureAutoYouTubeLiveFromVideo();
+  assert.equal(h.context.previewYouTubeConnection().status, 'ready');
+  assert.equal(h.calls.videos.length, 2);
+  assert.equal(h.calls.searches.length, 0);
+  assert.equal(h.calls.playlists.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('終了済みの確認用動画はチャンネルの登録だけに使い配信中キャッシュにはしない', () => {
+  const h = harness({ properties: { YOUTUBE_VIDEO_ID: 'ended_video' }, videos: [{
+    id: 'ended_video', snippet: { channelId: CHANNEL },
+    liveStreamingDetails: { actualStartTime: '2026-11-01T01:00:00Z', actualEndTime: '2026-11-01T02:00:00Z' }
+  }] });
+  h.context.configureAutoYouTubeLiveFromVideo();
+  assert.equal(h.values.CHANNEL_ID, CHANNEL);
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, undefined);
+  assert.equal(h.values['YOSAN_LIVE_VIDEO_' + CHANNEL], undefined);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('動画からの自動設定も処理中は設定を変えずAPIを呼ばない', () => {
+  const h = harness({ busy: true, properties: { YOUTUBE_VIDEO_ID: 'new_video01' } });
+  assert.equal(h.context.configureAutoYouTubeLiveFromVideo().status, 'busy');
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, 'new_video01');
+  assert.equal(h.calls.videos.length, 0);
 });
