@@ -11,6 +11,7 @@ const BOT_YOUTUBE_ERROR_KEY = 'YOSAN_YOUTUBE_LAST_ERROR_V1';
 const BOT_FEELING_HISTORY_KEY = 'YOSAN_FEELING_HISTORY_V1';
 const FEELING_HISTORY_SIZE = 8;
 const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+const DEFAULT_YOUTUBE_CHANNEL_ID = 'UCJ12W_V5k49jE0M38L32Ylg';
 const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
@@ -247,7 +248,7 @@ function getConfig_(analysisOnly) {
     geminiModel: (values.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim(),
     folderId: values.FOLDER_ID || '1oVuLTXQou6IVr6UkTOl6wFZAX7WMqfyO',
     spreadsheetId: values.SPREADSHEET_ID || '1VPDVJkFTzF1-71p377QwurQJVmVIVjW2vXOczi7VaGc',
-    channelId: values.CHANNEL_ID || 'UCJ12W_V5k49jE0M38L32Ylg',
+    channelId: values.CHANNEL_ID || DEFAULT_YOUTUBE_CHANNEL_ID,
     logSheetName: values.LOG_SHEET_NAME || '蚕ログ',
     dryRun: booleanProperty_(values, 'DRY_RUN', true),
     splitAccounts: booleanProperty_(values, 'SPLIT_ACCOUNT_MODE', false),
@@ -740,7 +741,7 @@ function findActiveLive_(config) {
     properties.setProperty(searchKey, String(Date.now()));
     const search = youtubeCall_(config, 100, function () {
       return YouTube.Search.list('id', {
-        channelId: config.channelId, eventType: 'live', type: 'video', maxResults: 5
+        channelId: config.channelId, eventType: 'live', type: 'video', order: 'date', maxResults: 50
       });
     });
     ids = (search.items || []).filter(function (item) { return item.id && item.id.videoId; })
@@ -1062,8 +1063,23 @@ function configureSplitAccountMode() {
   properties.setProperty('SPLIT_ACCOUNT_MODE', 'true');
   properties.setProperty('ENABLE_X', 'false');
   properties.setProperty('ENABLE_INSTAGRAM', 'false');
-  console.log('投稿先は現在の配信のYOUTUBE_VIDEO_IDを設定するか、CHANNEL_IDによる自動検出を使ってください。');
+  console.log('配信URLを自動で追う場合はconfigureAutoYouTubeLiveを1回実行してください。特定動画への固定はYOUTUBE_VIDEO_IDで指定できます。');
   console.log('学校はanalyzeLatestImageAndLog、個人はpostPreparedCommentToYouTubeを使ってください。');
+}
+
+/** 1回実行して動画ID固定を解除する。チャンネル内の配信中ライブを自動で探す。 */
+function configureAutoYouTubeLive() {
+  const properties = PropertiesService.getScriptProperties();
+  const channelId = (properties.getProperty('CHANNEL_ID') || DEFAULT_YOUTUBE_CHANNEL_ID).trim();
+  if (!/^UC[A-Za-z0-9_-]{22}$/.test(channelId)) {
+    throw new Error('CHANNEL_IDにはUCで始まる24文字のチャンネルIDを設定してください。設定は変更していません。');
+  }
+  properties.setProperty('CHANNEL_ID', channelId);
+  properties.deleteProperty('YOUTUBE_VIDEO_ID');
+  // 使用済み予算・検索間隔・解析済み文・投稿結果は維持する。
+  console.log('YouTube配信の自動検出を設定しました。対象チャンネル: ' + channelId);
+  console.log('配信URLが変わっても動画IDの更新は不要です。個人側でpreviewYouTubeConnectionを実行すると、投稿せず検出先を確認できます。');
+  return { status: 'configured', mode: 'auto', channelId: channelId };
 }
 
 /** 学校アカウントで実行：Drive・Gemini・Sheetsのみ。 */
@@ -1089,7 +1105,7 @@ function getYouTubeOnlyConfig_(event) {
   });
   const config = {
     dryRun: booleanProperty_(values, 'DRY_RUN', true),
-    channelId: values.CHANNEL_ID || 'UCJ12W_V5k49jE0M38L32Ylg',
+    channelId: values.CHANNEL_ID || DEFAULT_YOUTUBE_CHANNEL_ID,
     videoId: optionalYouTubeVideoId_(values),
     searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60),
     youtubeDailyBudget: integerBudgetProperty_(values, 'YOUTUBE_DAILY_UNIT_BUDGET', 8000),
@@ -1108,8 +1124,9 @@ function previewYouTubeConnection() {
   requireBotScopes_('youtube', false);
   const config = getYouTubeOnlyConfig_();
   const live = findActiveLive_(config);
+  if (live) console.log('検出した配信: https://www.youtube.com/watch?v=' + live.videoId);
   console.log(live && live.liveChatId ? 'YouTubeの配信中チャットを取得できました。投稿はしていません。' :
-    '投稿可能なライブチャットがありません。動画ID・配信中・チャット有効・実行アカウントを確認してください。');
+    '投稿可能なライブチャットがありません。対象チャンネル（固定時は動画ID）・配信中・チャット有効・実行アカウントを確認してください。');
   return { status: live && live.liveChatId ? 'ready' : 'no_live', videoId: live ? live.videoId : null };
 }
 
@@ -1165,7 +1182,7 @@ function postPreparedCommentToYouTube(event) {
     stage = '配信チャットの取得';
     const live = findActiveLive_(config);
     if (!live || !live.liveChatId) {
-      console.log('個人側でライブチャットが見つかりません。動画ID・配信中・チャット有効を確認してください。');
+      console.log('個人側でライブチャットが見つかりません。対象チャンネル（固定時は動画ID）・配信中・チャット有効を確認してください。');
       return { status: 'no_live', youtube: 'pending' };
     }
     stage = '投稿文の組立';

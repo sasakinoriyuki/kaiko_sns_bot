@@ -2311,3 +2311,114 @@ test('個人側診断で確認中の動画IDを表示するが投稿先を変更
   assert.equal(h.calls.channels, 1);
   assert.equal(h.calls.chats.length, 0);
 });
+
+test('自動検出設定は古い固定IDだけを解除し予算とunknownを維持する', () => {
+  const state = JSON.stringify({ youtube: 'unknown', feeling: 'ぼく、のんびり気分。', logged: true });
+  const limits = JSON.stringify({ youtube: { units: 700, nameSequence: 12, cooldownUntil: Date.now() + 100000 } });
+  const searchKey = 'YOSAN_LAST_SEARCH_' + CHANNEL;
+  const cacheKey = 'YOSAN_LIVE_VIDEO_' + CHANNEL;
+  const h = harness({ properties: { CHANNEL_ID: CHANNEL, YOUTUBE_VIDEO_ID: 'old_video01',
+    YOSAN_STATE_V1: state, YOSAN_LIMITS_V1: limits, YOSAN_FEELING_HISTORY_V1: '["ぼく、ここが好き。"]',
+    [searchKey]: '123456789', [cacheKey]: 'cached-live' },
+    triggers: ['analyzeLatestImageAndLog', 'postPreparedCommentToYouTube'] });
+  const before = { ...h.values };
+  const result = h.context.configureAutoYouTubeLive();
+  assert.equal(result.mode, 'auto');
+  assert.equal(result.channelId, CHANNEL);
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, undefined);
+  for (const key of Object.keys(before).filter(key => key !== 'YOUTUBE_VIDEO_ID')) assert.equal(h.values[key], before[key], key);
+  assert.equal(h.triggers.length, 2);
+  assert.equal(h.calls.channels, 0);
+  assert.equal(h.calls.searches.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('自動検出設定はキー不要で既定チャンネルを登録し不正チャンネルでは変更しない', () => {
+  const h = harness({ properties: { GEMINI_API_KEY: undefined, YOUTUBE_VIDEO_ID: '古いURLでも解除できる' } });
+  h.context.configureAutoYouTubeLive();
+  assert.equal(h.values.CHANNEL_ID, CHANNEL);
+  assert.equal(h.context.getYouTubeOnlyConfig_().videoId, '');
+  assert.equal(h.context.getYouTubeOnlyConfig_().channelId, CHANNEL);
+  const invalid = harness({ properties: { CHANNEL_ID: 'https://www.youtube.com/@example', YOUTUBE_VIDEO_ID: 'old_video01' } });
+  const before = JSON.stringify(invalid.values);
+  assert.throws(() => invalid.context.configureAutoYouTubeLive(), /CHANNEL_ID/);
+  assert.equal(JSON.stringify(invalid.values), before);
+});
+
+test('個人側の自動検出は継続中の古いライブから新しく開始した同じチャンネルへ切り替える', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  h.context.configureAutoYouTubeLive();
+  const old = h.liveVideo({ id: 'old_video01', liveStreamingDetails: {
+    actualStartTime: new Date(h.now() - 3600000).toISOString(), activeLiveChatId: 'old-chat' } });
+  h.setVideos([old]);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  h.advance(3600000);
+  const next = h.liveVideo({ id: 'new_video01', liveStreamingDetails: {
+    actualStartTime: new Date(h.now() - 60000).toISOString(), activeLiveChatId: 'new-chat' } });
+  const other = h.liveVideo({ id: 'other_video', snippet: { channelId: 'another-channel' }, liveStreamingDetails: {
+    actualStartTime: new Date(h.now()).toISOString(), activeLiveChatId: 'other-chat' } });
+  h.setVideos([old, next, other]);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  assert.deepEqual(h.calls.chats.map(call => call.payload.snippet.liveChatId), ['old-chat', 'new-chat']);
+  assert.equal(h.values.YOUTUBE_VIDEO_ID, undefined);
+  assert.equal(h.calls.searches.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('別アカウントの自動検出は対象チャンネルだけを検索し検索間隔後に新しい配信へ切り替える', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { ownsChannel: false, properties: { CHANNEL_ID: 'UCaaaaaaaaaaaaaaaaaaaaaa' } });
+  h.context.configureAutoYouTubeLive();
+  const channelId = h.values.CHANNEL_ID;
+  const video = (id, start, chat) => h.liveVideo({ id, snippet: { channelId },
+    liveStreamingDetails: { actualStartTime: new Date(start).toISOString(), activeLiveChatId: chat } });
+  const old = video('old_video01', h.now() - 3600000, 'old-chat');
+  h.setVideos([old]);
+  assert.equal(h.context.previewYouTubeConnection().videoId, 'old_video01');
+  assert.equal(h.calls.searches[0].params.channelId, channelId);
+  assert.equal(h.calls.searches[0].params.eventType, 'live');
+  assert.equal(h.calls.searches[0].params.order, 'date');
+  assert.equal(h.calls.searches[0].params.maxResults, 50);
+  h.advance(30 * 60000);
+  const next = video('new_video01', h.now() - 60000, 'new-chat');
+  h.setVideos([old, next]);
+  assert.equal(h.context.previewYouTubeConnection().videoId, 'old_video01');
+  assert.equal(h.calls.searches.length, 1);
+  h.advance(30 * 60000);
+  assert.equal(h.context.previewYouTubeConnection().videoId, 'new_video01');
+  assert.equal(h.calls.searches.length, 2);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('個人側は自動検出でライブがない間は待ち開始後は準備済みの文を投稿する', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([]);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'no_live');
+  assert.equal(h.calls.chats.length, 0);
+  h.advance(3600000);
+  h.setVideos([h.liveVideo({ id: 'new_video01' })]);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 1);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('自動検出の接続プレビューは選んだURLを表示し最新ライブのチャット無効を見送る', () => {
+  const school = preparedSchool(); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  h.context.configureAutoYouTubeLive();
+  h.setVideos([h.liveVideo({ id: 'new_video01' })]);
+  assert.equal(h.context.previewYouTubeConnection().status, 'ready');
+  assert.ok(h.calls.console.some(line => line.includes('https://www.youtube.com/watch?v=new_video01')));
+  const old = h.liveVideo({ id: 'old_video01', liveStreamingDetails: {
+    actualStartTime: new Date(h.now() - 3600000).toISOString(), activeLiveChatId: 'old-chat' } });
+  const next = h.liveVideo({ id: 'new_video01', liveStreamingDetails: {
+    actualStartTime: new Date(h.now() - 60000).toISOString() } });
+  h.setVideos([old, next]);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'no_live');
+  assert.equal(h.calls.chats.length, 0);
+});
