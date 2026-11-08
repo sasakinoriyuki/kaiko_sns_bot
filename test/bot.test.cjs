@@ -2842,3 +2842,121 @@ test('本文検査の更新でスクリプトプロパティのモデル指定�
   assert.ok(h.calls.gemini[0].url.endsWith('/gemini-3.6-flash:generateContent'));
   assert.equal(h.values.GEMINI_MODEL, 'gemini-3.6-flash');
 });
+
+test('学校の手動解析は24回予算でも1分後に同じ写真を解析でき待機時刻を表示する', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-08T05:59:00Z'),
+    properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '24', ENABLE_FEELING_VARIATION: 'true' },
+    geminiResponses: [careResponse('ぼく、この葉のふちが気になるな。'), careResponse('わたし、ここで体をゆるめたい気分。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const first = h.state();
+  h.advance(30000);
+  const waiting = h.context.analyzeLatestImageAndLog();
+  assert.equal(waiting.status, 'rate_limited');
+  assert.ok(waiting.reason.includes('2026/11/08 15:00:00'));
+  assert.ok(waiting.reason.includes('あと約30秒'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.state().analysisKey, first.analysisKey);
+  h.advance(30000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().key, first.key);
+  assert.ok(h.state().analysisKey !== first.analysisKey);
+  assert.equal(h.state().feeling, 'わたし、ここで体をゆるめたい気分。');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '24');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('明示的な学校の手動更新は変化モード無効でも新しい本文を記録し名前を進めない', () => {
+  const h = preparedSchool({ properties: { GEMINI_DAILY_REQUEST_BUDGET: '24', ENABLE_FEELING_VARIATION: 'false' },
+    geminiResponses: [geminiResponse('ぼく、この葉のふちが気になるな。'), geminiResponse('わたし、ここで体をゆるめたい気分。')] });
+  h.context.analyzeLatestImageAndLog();
+  const state = h.state(); state.youtube = 'sent';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  const limits = JSON.parse(h.values.YOSAN_LIMITS_V1); limits.youtube.nameSequence = 12;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().youtube, 'pending');
+  assert.equal(h.state().feeling, 'わたし、ここで体をゆるめたい気分。');
+  assert.equal(h.calls.logs.length, 2);
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 12);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('手動解析を短くしても日次予算到達後は自動解析も追加しない', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-08T05:00:00Z'), properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '2' },
+    geminiResponses: [careResponse('ぼく、この葉のふちが気になるな。'), careResponse('わたし、ここで体をゆるめたい気分。')] });
+  h.context.analyzeLatestImageAndLog();
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  h.advance(60000);
+  const blocked = h.context.analyzeLatestImageAndLog();
+  assert.equal(blocked.status, 'rate_limited');
+  assert.ok(blocked.reason.includes('1日予算'));
+  h.advance(3600000);
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
+});
+
+test('学校の手動更新もGemini429の待機を解除しない', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-08T05:00:00Z'), properties: CARE_PROPERTIES,
+    geminiResponses: [response(429, {}), careResponse()] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  const before = h.values.YOSAN_LIMITS_V1;
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.values.YOSAN_LIMITS_V1, before);
+});
+
+test('解析プレビューの連続API呼出しは従来の間隔を維持する', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-08T05:00:00Z'), properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '24' },
+    geminiResponses: [careResponse(), careResponse('わたし、ここで体をゆるめたい気分。')] });
+  assert.equal(h.context.previewSchoolAnalysis().status, 'preview');
+  h.advance(60000); h.refreshImage();
+  const blocked = h.context.previewSchoolAnalysis();
+  assert.equal(blocked.status, 'rate_limited');
+  assert.ok(blocked.reason.includes('2026/11/08 15:00:00'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('変化モードも飼育UIも無効な学校の手動更新でもunknownを解除しない', () => {
+  for (const refreshImage of [false, true]) {
+    const h = preparedSchool();
+    h.context.analyzeLatestImageAndLog();
+    const state = h.state(); state.youtube = 'unknown';
+    h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+    const limits = h.values.YOSAN_LIMITS_V1;
+    h.advance(60000);
+    if (refreshImage) h.refreshImage();
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'unknown');
+    assert.equal(h.state().youtube, 'unknown');
+    assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('学校の初回記録は利用できる解析プレビューを再利用し余分にAPIを呼ばない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  assert.equal(h.context.previewSchoolAnalysis().status, 'preview');
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('使用量表示は学校の手動更新と解析プレビューの間隔を区別する', () => {
+  const h = preparedSchool({ properties: { GEMINI_DAILY_REQUEST_BUDGET: '24', GEMINI_MODEL: 'gemini-3.6-flash' } });
+  const before = JSON.stringify(h.values);
+  const report = h.context.showBotUsage();
+  assert.equal(report.model, 'gemini-3.6-flash');
+  assert.equal(report.schoolManualAnalysisMinMinutes, 1);
+  assert.equal(report.geminiMinMinutes, 60);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.gemini.length, 0);
+});

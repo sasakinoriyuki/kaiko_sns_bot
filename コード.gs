@@ -88,6 +88,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
   try {
     const config = getConfig_(analysisOnly);
     analysisOnly = Boolean(analysisOnly || config.splitAccounts);
+    config.manualAnalysisRefresh = Boolean(analysisOnly && refreshFeeling && !triggerDriven);
     config.triggerDriven = Boolean(triggerDriven);
     if (config.triggerDriven) config.youtubeMinMinutes = 1; // 投稿周期は時間主導トリガーが決める。連続実行だけ1分抑制。
     const file = findLatestImage_(config.folderId);
@@ -136,7 +137,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
     let state = readJsonProperty_(properties, BOT_STATE_KEY);
     if (!state || state.key !== image.key) {
       const blocked = state && ['sending', 'unknown'].indexOf(state.youtube) !== -1 &&
-        (config.varyFeelings || config.enableNamedComments || config.enableRearingContext || state.analysisVersion !== analysisVersion);
+        (config.manualAnalysisRefresh || config.varyFeelings || config.enableNamedComments || config.enableRearingContext || state.analysisVersion !== analysisVersion);
       if (blocked) state.youtube = 'unknown';
       else state = { key: image.key, feeling: null, logged: false, youtube: 'pending', x: 'pending', instagram: 'pending' };
     }
@@ -153,8 +154,8 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
       if (lastPost === undefined) state.youtubeSentAt = Date.now();
       else if (config.triggerDriven || Date.now() - lastPost >= config.youtubeMinMinutes * 60000) state.youtube = 'pending';
     }
-    const refreshRequested = config.varyFeelings && Boolean(refreshFeeling || triggerDriven);
-    if (state.youtube === 'unknown' && (config.varyFeelings || config.enableNamedComments ||
+    const refreshRequested = config.manualAnalysisRefresh || config.varyFeelings && Boolean(refreshFeeling || triggerDriven);
+    if (state.youtube === 'unknown' && (config.manualAnalysisRefresh || config.varyFeelings || config.enableNamedComments ||
         config.enableRearingContext || state.analysisVersion !== analysisVersion)) {
       saveState_(properties, state);
       console.log('前回の投稿結果が不明なため、実況文の更新も確認まで待機します。');
@@ -167,7 +168,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
         previewFeeling || analyzeImageWithGemini(image.base64, image.mimeType, config);
       if (config.enableRearingContext) state.rearing = config.rearingObservation;
       state.analysisVersion = analysisVersion;
-      if (config.varyFeelings || config.enableRearingContext || needsAnalysisUpdate) {
+      if (config.varyFeelings || config.enableRearingContext || needsAnalysisUpdate || regenerate) {
         state.generatedAt = Date.now();
         state.analysisKey = image.key + ':feeling:' + state.generatedAt;
         state.youtube = 'pending';
@@ -387,11 +388,14 @@ function reserveGeminiAttempt_(config) {
   checkCooldown_(row, 'Gemini');
   resetDailyCounter_(row);
   if ((row.count || 0) >= config.geminiDailyBudget) throw waitError_('GeminiのBOT用1日予算に達したため待機します。');
-  // 時間主導トリガーは選ばれた周期で解析する。日次予算は維持する。
-  // 手動実行は予算を均等配分し、連続実行はトリガーでも最短1分空ける。
-  const interval = (config.triggerDriven ? 1 : Math.max(10, 1440 / config.geminiDailyBudget)) * 60000;
+  // 自動解析はトリガー周期、学校の明示的な手動更新も最短1分。全試行を同じ日次予算に数える。
+  // 解析プレビュー等の手動実行は、従来の予算の均等配分を維持する。
+  const interval = (config.triggerDriven || config.manualAnalysisRefresh ? 1 : Math.max(10, 1440 / config.geminiDailyBudget)) * 60000;
   if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
-    throw waitError_('Geminiの解析間隔を空けるため待機します。');
+    const nextAttempt = row.lastAttempt + interval;
+    throw waitError_('Geminiの解析間隔を空けるため待機します。次回: ' +
+      Utilities.formatDate(new Date(nextAttempt), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') +
+      ' 以降（あと約' + Math.ceil((nextAttempt - Date.now()) / 1000) + '秒）');
   }
   row.count = (row.count || 0) + 1;
   row.lastAttempt = Date.now();
@@ -508,6 +512,8 @@ function showBotUsage() {
     model: config.geminiModel,
     geminiDailyBudget: config.geminiDailyBudget,
     geminiMinMinutes: Math.max(10, 1440 / config.geminiDailyBudget),
+    schoolManualAnalysisMinMinutes: 1,
+    geminiIntervalNote: '学校のanalyzeLatestImageAndLogの手動更新は1分。geminiMinMinutesは解析プレビュー等の従来の手動間隔。全試行を同じ日次予算に数える。',
     youtubeMinMinutes: config.youtubeMinMinutes,
     youtubeAutomaticInterval: 'GASの時間主導トリガーで設定（手動実行はyoutubeMinMinutes）',
     youtubeDailyUnitBudget: config.youtubeDailyBudget,
