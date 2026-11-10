@@ -11,6 +11,9 @@ const BOT_YOUTUBE_ERROR_KEY = 'YOSAN_YOUTUBE_LAST_ERROR_V1';
 const BOT_FEELING_HISTORY_KEY = 'YOSAN_FEELING_HISTORY_V1';
 const FEELING_HISTORY_SIZE = 8;
 const COIN_TOPIC_GAP = 4;
+const SCHEDULED_RETRY_PREFIX = 'YOSAN_RETRY_V1_';
+const SCHEDULED_MAX_ATTEMPTS = 3;
+const SCHEDULED_WINDOW_MS = 60 * 60000;
 const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
 const DEFAULT_YOUTUBE_CHANNEL_ID = 'UCJ12W_V5k49jE0M38L32Ylg';
 const QUOTA_TIME_ZONE = 'America/Los_Angeles';
@@ -237,7 +240,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
   } catch (error) {
     if (error.botWait) {
       console.log(error.message);
-      return { status: error.botStatus || 'rate_limited', reason: error.message };
+      return { status: error.botStatus || 'rate_limited', reason: error.message, retryAt: error.retryAt };
     }
     throw error;
   } finally {
@@ -378,7 +381,12 @@ function quotaDay_() {
 }
 
 function checkCooldown_(row, label) {
-  if ((row.cooldownUntil || 0) > Date.now()) throw waitError_(label + 'のAPI制限が回復するまで待機します。');
+  if ((row.cooldownUntil || 0) > Date.now()) {
+    const error = waitError_(label + 'の再実行待ちです。次回: ' +
+      Utilities.formatDate(new Date(row.cooldownUntil), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降');
+    error.retryAt = row.cooldownUntil;
+    throw error;
+  }
 }
 
 function resetDailyCounter_(row) {
@@ -397,9 +405,11 @@ function reserveGeminiAttempt_(config) {
   const interval = (config.triggerDriven || config.manualAnalysisRefresh ? 1 : Math.max(10, 1440 / config.geminiDailyBudget)) * 60000;
   if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
     const nextAttempt = row.lastAttempt + interval;
-    throw waitError_('Geminiの解析間隔を空けるため待機します。次回: ' +
+    const error = waitError_('Geminiの解析間隔を空けるため待機します。次回: ' +
       Utilities.formatDate(new Date(nextAttempt), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') +
       ' 以降（あと約' + Math.ceil((nextAttempt - Date.now()) / 1000) + '秒）');
+    error.retryAt = nextAttempt;
+    throw error;
   }
   row.count = (row.count || 0) + 1;
   row.lastAttempt = Date.now();
@@ -415,7 +425,9 @@ function reserveYouTubeUnits_(config, units, isPost, coinPost) {
     throw waitError_('YouTubeのBOT用1日クォータ予算に達したため待機します。');
   }
   if (isPost && row.lastPost && Date.now() - row.lastPost < config.youtubeMinMinutes * 60000) {
-    throw waitError_('YouTubeへの投稿は最短' + config.youtubeMinMinutes + '分間隔です。');
+    const error = waitError_('YouTubeへの投稿は最短' + config.youtubeMinMinutes + '分間隔です。');
+    error.retryAt = row.lastPost + config.youtubeMinMinutes * 60000;
+    throw error;
   }
   row.count = (row.count || 0) + units;
   if (isPost) row.lastPost = Date.now();
@@ -520,7 +532,9 @@ function showBotUsage() {
     schoolManualAnalysisMinMinutes: 1,
     geminiIntervalNote: '学校のanalyzeLatestImageAndLogの手動更新は1分。geminiMinMinutesは解析プレビュー等の従来の手動間隔。全試行を同じ日次予算に数える。',
     youtubeMinMinutes: config.youtubeMinMinutes,
-    youtubeAutomaticInterval: 'GASの時間主導トリガーで設定（手動実行はyoutubeMinMinutes）',
+    youtubeAutomaticInterval: 'GASの時間主導トリガー。分担の自動投稿・再試行もyoutubeMinMinutesを守る。',
+    scheduledMaxAttempts: SCHEDULED_MAX_ATTEMPTS,
+    scheduledRetryWindowMinutes: SCHEDULED_WINDOW_MS / 60000,
     youtubeDailyUnitBudget: config.youtubeDailyBudget,
     instagramEnabled: config.enableInstagram,
     instagramDailyBudget: config.instagramDailyBudget,
@@ -640,15 +654,22 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
       payload: JSON.stringify(payload), muteHttpExceptions: true
     });
   } catch (error) {
-    setCooldown_('gemini', Date.now() + 30 * 60000);
-    throw new Error('Geminiへの接続に失敗しました。');
+    const retryAt = Date.now() + 3 * 60000;
+    setCooldown_('gemini', retryAt);
+    throw transientGeminiError_('Geminiへの接続に失敗しました。', retryAt);
   }
   const code = response.getResponseCode();
   if (code === 429) {
     setCooldown_('gemini', Math.max(nextQuotaReset_(), responseResetAt_(response, Date.now() + 60000)) + 60000);
     throw waitError_('Gemini API HTTP 429。次の割当日まで自動実行を待機します。');
   }
-  if (code >= 500) setCooldown_('gemini', responseResetAt_(response, Date.now() + 30 * 60000));
+  if (code >= 500) {
+    const retryAt = responseResetAt_(response, Date.now() + 3 * 60000);
+    setCooldown_('gemini', retryAt);
+    const error = transientGeminiError_('Gemini API HTTP ' + code + '。Gemini側の一時的な混雑・障害です。', retryAt);
+    error.botRetryable = [500, 502, 503, 504].indexOf(code) !== -1;
+    throw error;
+  }
   if (code !== 200) throw new Error('Gemini API HTTP ' + code + '（モデル名・キー・割当を確認）。');
   const data = parseApiJson_(response, 'Gemini');
   if (data.usageMetadata) {
@@ -1037,11 +1058,147 @@ function installTenMinuteTrigger() {
 }
 
 function removeBotTriggers() {
+  const roles = new Set();
   ScriptApp.getProjectTriggers().filter(function (trigger) {
-    return [BOT_HANDLER, 'analyzeLatestImageAndLog', 'postPreparedCommentToYouTube'].indexOf(trigger.getHandlerFunction()) !== -1;
+    const handler = trigger.getHandlerFunction();
+    if (handler === 'analyzeLatestImageAndLog' || handler === 'retrySchoolAnalysis') roles.add('school');
+    if (handler === 'postPreparedCommentToYouTube' || handler === 'retryPersonalYouTube') roles.add('youtube');
+    return [BOT_HANDLER, 'analyzeLatestImageAndLog', 'postPreparedCommentToYouTube',
+      'retrySchoolAnalysis', 'retryPersonalYouTube'].indexOf(handler) !== -1;
+  }).forEach(function (trigger) { ScriptApp.deleteTrigger(trigger); });
+  roles.forEach(function (role) { PropertiesService.getScriptProperties().deleteProperty(SCHEDULED_RETRY_PREFIX + role); });
+}
+
+/** 503等は認証エラーと分け、APIの待機指示を短縮しない。 */
+function transientGeminiError_(message, retryAt) {
+  const error = new Error(message + ' 次回: ' +
+    Utilities.formatDate(new Date(retryAt), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降。');
+  error.botRetryable = true;
+  error.retryAt = retryAt;
+  return error;
+}
+
+function retrySchoolAnalysis(event) {
+  requireBotScopes_('school', false);
+  return runScheduledRole_('school', event, true);
+}
+
+function retryPersonalYouTube(event) {
+  requireBotScopes_('youtube', false);
+  return runScheduledRole_('youtube', event, true);
+}
+
+function scheduledRetryHandler_(role) {
+  return role === 'school' ? 'retrySchoolAnalysis' : 'retryPersonalYouTube';
+}
+
+function clearScheduledRetryTriggers_(role) {
+  const handler = scheduledRetryHandler_(role);
+  ScriptApp.getProjectTriggers().filter(function (trigger) {
+    return trigger.getHandlerFunction() === handler;
   }).forEach(function (trigger) { ScriptApp.deleteTrigger(trigger); });
 }
 
+function readScheduledRetry_(properties, role) {
+  const value = readJsonProperty_(properties, SCHEDULED_RETRY_PREFIX + role);
+  if (value === null) return null;
+  if (!value || Array.isArray(value) || typeof value.id !== 'string' ||
+      typeof value.pending !== 'boolean' ||
+      ['startedAt', 'expiresAt', 'attempts', 'nextAt'].some(function (key) {
+        return !Number.isSafeInteger(value[key]) || value[key] < 0;
+      }) || value.attempts > SCHEDULED_MAX_ATTEMPTS || value.expiresAt < value.startedAt) {
+    throw new Error('BOTの再試行予約が不正です。' + role + 'の設定を確認してください。');
+  }
+  return value;
+}
+
+/** 同じ時間枠の再試行。待機中にロックを保持せず、同一ユーザーの単発トリガーを最大1本だけ作る。 */
+function runScheduledRole_(role, event, isRetry) {
+  const properties = PropertiesService.getScriptProperties();
+  const key = SCHEDULED_RETRY_PREFIX + role;
+  clearScheduledRetryTriggers_(role);
+  let window = isRetry ? readScheduledRetry_(properties, role) : {
+    id: String(Date.now()) + ':' + String(event && event.triggerUid || ''),
+    startedAt: Date.now(), expiresAt: Date.now() + SCHEDULED_WINDOW_MS,
+    attempts: 0, pending: false, nextAt: 0
+  };
+  if (isRetry && (!window || !window.pending)) return { status: 'no_retry' };
+  if (isRetry && (Date.now() >= window.expiresAt || window.attempts >= SCHEDULED_MAX_ATTEMPTS)) {
+    properties.deleteProperty(key);
+    console.log(role + ': この時間枠の再試行は終了しました。次の定期実行を待ちます。');
+    return { status: 'retry_expired' };
+  }
+  if (isRetry) {
+    const state = readJsonProperty_(properties, BOT_STATE_KEY);
+    const completed = state && (role === 'school'
+      ? state.logged && [REARING_ANALYSIS_VERSION, LEGACY_ANALYSIS_VERSION].indexOf(state.analysisVersion) !== -1 && Number.isFinite(state.generatedAt) && state.generatedAt > window.startedAt
+      : state.youtube !== 'unknown' && state.youtube !== 'sending' && Number.isFinite(state.youtubeSentAt) && state.youtubeSentAt > window.startedAt);
+    if (completed) {
+      properties.deleteProperty(key);
+      return { status: role === 'school' ? 'prepared' : 'processed', alreadyCompleted: true };
+    }
+    if (Date.now() < window.nextAt) return scheduleRoleRetry_(properties, role, window, window.nextAt, { status: 'retry_wait' });
+  }
+  window.attempts++;
+  window.pending = false;
+  window.nextAt = 0;
+  properties.setProperty(key, JSON.stringify(window));
+  let result;
+  try {
+    result = role === 'school' ? runBot_(false, true, true, true) :
+      postPreparedCommentToYouTube_({ triggerUid: String(event && event.triggerUid || 'retry'), respectPostInterval: true });
+  } catch (error) {
+    if (!error.botRetryable) {
+      const failedWindow = readScheduledRetry_(properties, role);
+      if (failedWindow && failedWindow.id === window.id) properties.deleteProperty(key);
+      throw error;
+    }
+    console.log(error.message);
+    result = { status: 'temporary_error', reason: error.message, retryAt: error.retryAt, retryable: true };
+  }
+  const current = readScheduledRetry_(properties, role);
+  if (!current || current.id !== window.id || current.attempts !== window.attempts) return result;
+  const retryable = result.retryable || result.status === 'busy' ||
+    result.status === 'rate_limited' && Number.isFinite(result.retryAt) ||
+    role === 'school' && ['voice_mismatch', 'grounding_mismatch', 'duplicate_comment'].indexOf(result.status) !== -1 ||
+    role === 'youtube' && ['waiting_analysis', 'waiting_fresh_analysis', 'no_live'].indexOf(result.status) !== -1;
+  if (!retryable || window.attempts >= SCHEDULED_MAX_ATTEMPTS) {
+    properties.deleteProperty(key);
+    if (retryable) console.log(role + ': 最大3試行に達したため、次の定期実行を待ちます。');
+    return result;
+  }
+  const delays = role === 'school' ? [2, 5] : [5, 10];
+  const delayMs = Math.min(delays[window.attempts - 1] * 60000, Math.max(60000, window.expiresAt - Date.now() - 60000));
+  let nextAt = Math.max(Date.now() + delayMs, result.retryAt || 0);
+  if (role === 'youtube' && ['waiting_analysis', 'waiting_fresh_analysis', 'busy'].indexOf(result.status) !== -1) {
+    const schoolRetry = readScheduledRetry_(properties, 'school');
+    if (schoolRetry && schoolRetry.pending) nextAt = Math.max(nextAt, schoolRetry.nextAt + 2 * 60000);
+  }
+  return scheduleRoleRetry_(properties, role, window, nextAt, result);
+}
+
+function scheduleRoleRetry_(properties, role, window, nextAt, result) {
+  const key = SCHEDULED_RETRY_PREFIX + role;
+  if (nextAt >= window.expiresAt) {
+    properties.deleteProperty(key);
+    console.log(role + ': 待機指示が時間枠を超えるため、次の定期実行を待ちます。');
+    return result;
+  }
+  window.pending = true;
+  window.nextAt = nextAt;
+  properties.setProperty(key, JSON.stringify(window));
+  try {
+    clearScheduledRetryTriggers_(role);
+    ScriptApp.newTrigger(scheduledRetryHandler_(role)).timeBased().after(Math.max(60000, nextAt - Date.now())).create();
+  } catch (error) {
+    properties.deleteProperty(key);
+    console.error(role + ': 再試行の予約を作成できません。各アカウントで専用トリガー作成関数を実行し、作成権限とトリガー数を確認してください。');
+    return Object.assign({}, result, { retryScheduled: false });
+  }
+  console.log(role + ': 再試行' + window.attempts + '/2を ' +
+    Utilities.formatDate(new Date(nextAt), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降に予約しました。');
+  return Object.assign({}, result, { retryScheduled: true, retryAt: nextAt });
+}
 
 /** Instagram API with Instagram Login。追加のGemini呼び出しは行わない。 */
 function reserveInstagramAttempt_(config) {
@@ -1214,7 +1371,8 @@ function configureAutoYouTubeLiveFromVideo() {
 /** 学校アカウントで実行：Drive・Gemini・Sheetsのみ。 */
 function analyzeLatestImageAndLog(event) {
   requireBotScopes_('school', false);
-  return runBot_(false, Boolean(event && event.triggerUid), true, true);
+  if (event && event.triggerUid) return runScheduledRole_('school', event, false);
+  return runBot_(false, false, true, true);
 }
 
 function previewSchoolAnalysis() {
@@ -1245,7 +1403,7 @@ function getYouTubeOnlyConfig_(event) {
   };
   Object.assign(config, namedCommentConfig_(values));
   if (config.searchIntervalMinutes < 60 || config.youtubeMinMinutes < 10) throw new Error('検索は60分以上、手動投稿は10分以上の間隔にしてください。');
-  if (config.triggerDriven) config.youtubeMinMinutes = 1;
+  if (config.triggerDriven && !(event && event.respectPostInterval)) config.youtubeMinMinutes = 1;
   return config;
 }
 
@@ -1262,6 +1420,11 @@ function previewYouTubeConnection() {
 /** 個人アカウントで実行：共有Propertiesの解析済み実況文だけをYouTubeへ投稿。 */
 function postPreparedCommentToYouTube(event) {
   requireBotScopes_('youtube', false);
+  if (event && event.triggerUid) return runScheduledRole_('youtube', event, false);
+  return postPreparedCommentToYouTube_(event);
+}
+
+function postPreparedCommentToYouTube_(event) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return { status: 'busy' };
   let stage = '設定の読込';
@@ -1328,7 +1491,8 @@ function postPreparedCommentToYouTube(event) {
   } catch (error) {
     const diagnostic = rememberYouTubeDiagnostic_(error, stage);
     console.error('個人側YouTube処理 [' + diagnostic.stage + ' / ' + diagnostic.code + ']: ' + diagnostic.detail);
-    return { status: error.botWait ? error.botStatus || 'rate_limited' : 'error', stage: stage, code: diagnostic.code };
+    return { status: error.botWait ? error.botStatus || 'rate_limited' : 'error', stage: stage, code: diagnostic.code,
+      retryAt: error.retryAt, retryable: stage === '配信チャットの取得' && /backendError|internalError|serviceUnavailable|(?:^|[^0-9])50[0234](?:[^0-9]|$)/i.test(String(error && error.message || '')) };
   } finally {
     lock.releaseLock();
   }
@@ -1447,9 +1611,9 @@ function diagnosePersonalYouTube() {
 function configureHourlyCommentary() {
   const properties = PropertiesService.getScriptProperties();
   properties.setProperty('ENABLE_FEELING_VARIATION', 'true');
-  properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '24');
+  properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '72');
   properties.setProperty('YOUTUBE_MIN_INTERVAL_MINUTES', '60');
-  console.log('実況の変化を有効にしました。学校・個人それぞれのトリガーを1時間に設定してください。');
+  console.log('実況の変化を有効にしました。自動処理は通常毎時1回、失敗時は最大2回再試行、解析予算は72試行/日です。学校・個人それぞれのトリガーを1時間に設定してください。');
 }
 
 function normalizeFeeling_(text) {

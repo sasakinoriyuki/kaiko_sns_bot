@@ -20,7 +20,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
   let now = options.now ?? Date.now();
-  const calls = { triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
+  const calls = { retryDelays: [], triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     channelRequests: [], playlists: [], scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { ENABLE_REARING_CONTEXT: 'false', GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
@@ -217,8 +217,8 @@ function harness(options = {}) {
       getProjectTriggers: () => [...triggers],
       deleteTrigger: (trigger) => triggers.splice(triggers.indexOf(trigger), 1),
       newTrigger(handler) {
-        return { timeBased() { return this; }, everyMinutes(minutes) { assert.equal(minutes, 30); calls.triggerIntervals.push({ handler, minutes }); return this; }, everyHours(hours) { assert.equal(hours, 1); calls.triggerIntervals.push({ handler, hours }); return this; },
-          create() { triggers.push({ getHandlerFunction: () => handler }); } };
+        return { timeBased() { return this; }, after(ms) { calls.retryDelays.push({ handler, ms }); return this; }, everyMinutes(minutes) { assert.equal(minutes, 30); calls.triggerIntervals.push({ handler, minutes }); return this; }, everyHours(hours) { assert.equal(hours, 1); calls.triggerIntervals.push({ handler, hours }); return this; },
+          create() { if (options.failTriggerCreate) throw new Error('trigger permission private-token'); triggers.push({ getHandlerFunction: () => handler }); } };
       }
     }
   });
@@ -1210,7 +1210,7 @@ test('個人側はDrive・Sheets・Geminiキーなしで共有された実況文
   assert.equal(h.calls.channels, 0);
   assert.equal(h.calls.videos[0].params.id, 'J1XMapSSHeI');
   assert.ok(h.calls.scopes.every(call => call.scopes.every(s => s.includes('youtube'))));
-  h.advance(5 * 60000);
+  h.advance(10 * 60000);
   assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).youtube, 'sent');
   assert.equal(h.calls.chats.length, 2);
 });
@@ -1411,7 +1411,7 @@ test('1時間移行は認証情報・投稿状態・消費済み割当を維持�
   const before = { state: h.values.YOSAN_STATE_V1, limits: h.values.YOSAN_LIMITS_V1, key: h.values.GEMINI_API_KEY };
   h.context.configureHourlyCommentary();
   assert.equal(h.values.ENABLE_FEELING_VARIATION, 'true');
-  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '24');
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '72');
   assert.equal(h.values.YOUTUBE_MIN_INTERVAL_MINUTES, '60');
   assert.equal(h.values.YOSAN_STATE_V1, before.state);
   assert.equal(h.values.YOSAN_LIMITS_V1, before.limits);
@@ -3207,4 +3207,296 @@ test('観察者の過去文は比較用プロンプトへ再投入せず元の�
   assert.ok(request.contents[0].parts[0].text.includes(valid));
   assert.ok(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts.includes(invalid));
   assert.equal(h.calls.gemini.length, 1);
+});
+
+test('自動解析の503は単発トリガーで再試行し成功後は予約を残さない', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-10T13:00:00Z'),
+    properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '72' },
+    geminiResponses: [response(503, {}), careResponse()] });
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(first.status, 'temporary_error');
+  assert.equal(first.retryScheduled, true);
+  assert.ok(!first.reason.includes('キー'));
+  assert.equal(h.calls.retryDelays[0].ms, 180000);
+  assert.equal(h.triggers.filter(x => x.getHandlerFunction() === 'retrySchoolAnalysis').length, 1);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.releases, 1);
+  assert.deepEqual(h.calls.sleeps, []);
+  h.advance(180000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+  assert.equal(h.triggers.filter(x => x.getHandlerFunction() === 'retrySchoolAnalysis').length, 0);
+});
+
+test('自動解析は失敗が続いても一つの時間枠で最大3試行に止める', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: Array.from({ length: 4 }, () => response(503, {})) });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  h.advance(180000); h.context.retrySchoolAnalysis({ triggerUid: 'retry1' });
+  assert.equal(h.calls.retryDelays[1].ms, 300000);
+  h.advance(300000); h.context.retrySchoolAnalysis({ triggerUid: 'retry2' });
+  assert.equal(h.calls.gemini.length, 3);
+  assert.equal(h.calls.retryDelays.length, 2);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'late' }).status, 'no_retry');
+  assert.equal(h.calls.gemini.length, 3);
+});
+
+test('GeminiのRetry-Afterが時間枠を超えたら短縮せず次の定期実行を待つ', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-10T13:00:00Z'), properties: CARE_PROPERTIES,
+    geminiResponses: [response(503, {}, { 'Retry-After': '3600' })] });
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(result.status, 'temporary_error');
+  assert.equal(h.calls.retryDelays.length, 0);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+  assert.ok(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.cooldownUntil >= h.now() + 3600000);
+});
+
+test('429や日次予算では再試行を使って制限を解除しない', () => {
+  const quota = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [response(429, {})] });
+  assert.equal(quota.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'rate_limited');
+  assert.equal(quota.calls.retryDelays.length, 0);
+  const budget = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '1' },
+    geminiResponses: [response(503, {}), careResponse()] });
+  budget.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  budget.advance(180000);
+  assert.equal(budget.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'rate_limited');
+  assert.equal(budget.calls.gemini.length, 1);
+  assert.equal(budget.values.GEMINI_DAILY_REQUEST_BUDGET, '1');
+  assert.equal(budget.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('自動解析の本文検査で見送った場合も時間枠内で別実行を予約する', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('画面の向こうから見守っているみんな、ぼくらが見えるかな。'),
+    careResponse('ぼく、この葉の形が好きだな。')
+  ] });
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(first.status, 'voice_mismatch');
+  assert.equal(first.retryScheduled, true);
+  assert.equal(h.calls.retryDelays[0].ms, 120000);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('個人側が学校の解析前に動いても再確認で投稿しGeminiには触れない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  const h = personalWithPrepared(school);
+  const first = h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(first.status, 'waiting_analysis');
+  assert.equal(first.retryScheduled, true);
+  assert.equal(h.calls.retryDelays[0].ms, 300000);
+  school.context.analyzeLatestImageAndLog();
+  h.values.YOSAN_STATE_V1 = school.values.YOSAN_STATE_V1;
+  h.values.YOSAN_LIMITS_V1 = school.values.YOSAN_LIMITS_V1;
+  h.advance(300000);
+  assert.equal(h.context.retryPersonalYouTube({ triggerUid: 'retry' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 1);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.values.GEMINI_API_KEY, undefined);
+  assert.equal(h.values.YOSAN_RETRY_V1_youtube, undefined);
+});
+
+test('個人側の再確認は学校側に保存された待機時刻より後に合わせる', () => {
+  const school = preparedSchool();
+  const h = personalWithPrepared(school);
+  h.values.YOSAN_RETRY_V1_school = JSON.stringify({ id: 'school-window', startedAt: h.now(),
+    expiresAt: h.now() + 55 * 60000, attempts: 1, pending: true, nextAt: h.now() + 30 * 60000 });
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(h.calls.retryDelays[0].ms, 32 * 60000);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('ロック競合で個人側がスキップしても後で再確認する', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { busy: true });
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'busy');
+  assert.equal(h.calls.chats.length, 0);
+  h.context.LockService.getScriptLock = () => ({ tryLock: () => true, releaseLock: () => {} });
+  h.advance(300000);
+  assert.equal(h.context.retryPersonalYouTube({ triggerUid: 'retry' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('YouTube送信の成功不明では再試行せず二重投稿を防ぐ', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { chatFailure: new Error('503 backendError') });
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' }).status, 'error');
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(h.calls.retryDelays.length, 0);
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube({ triggerUid: 'personal2' }).status, 'unknown');
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('学校側を手動で復旧した後は予約済みの再試行で余分に解析しない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [response(503, {}), careResponse()] });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  h.advance(180000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const before = h.values.YOSAN_STATE_V1;
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).alreadyCompleted, true);
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.values.YOSAN_STATE_V1, before);
+});
+
+test('個人側で手動投稿が完了した後は予約済みの再確認で再送しない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  const h = personalWithPrepared(school);
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  school.context.analyzeLatestImageAndLog();
+  h.values.YOSAN_STATE_V1 = school.values.YOSAN_STATE_V1;
+  h.values.YOSAN_LIMITS_V1 = school.values.YOSAN_LIMITS_V1;
+  h.advance(300000);
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.context.retryPersonalYouTube({ triggerUid: 'retry' }).alreadyCompleted, true);
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('早すぎる再試行や重複した呼出しで余分なAPIや予約を増やさない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [response(503, {}), careResponse()] });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  h.advance(60000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'early' }).status, 'retry_wait');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.triggers.filter(x => x.getHandlerFunction() === 'retrySchoolAnalysis').length, 1);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'due' }).status, 'prepared');
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'duplicate' }).status, 'no_retry');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('時間枠を過ぎた再試行は終了し次の毎時実行で新しい時間枠を始める', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [response(503, {}), careResponse()] });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  h.advance(61 * 60000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'late' }).status, 'retry_expired');
+  assert.equal(h.calls.gemini.length, 1);
+  h.advance(4 * 60000);
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'next-hour' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('停止処理は自分の再試行だけを消し他方のアカウントの予約や使用量を残す', () => {
+  const h = harness({ triggers: ['postPreparedCommentToYouTube', 'retryPersonalYouTube', 'otherHandler'],
+    properties: { YOSAN_RETRY_V1_school: 'school-owned-data', YOSAN_RETRY_V1_youtube: 'own-data',
+      YOSAN_LIMITS_V1: '{"gemini":{"count":12}}' } });
+  h.context.removeBotTriggers();
+  assert.deepEqual(h.triggers.map(x => x.getHandlerFunction()), ['otherHandler']);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, 'school-owned-data');
+  assert.equal(h.values.YOSAN_RETRY_V1_youtube, undefined);
+  assert.equal(h.values.YOSAN_LIMITS_V1, '{"gemini":{"count":12}}');
+});
+
+test('再試行トリガーを作成できない時は明示し秘密の例外文を流さない', () => {
+  const h = preparedSchool({ failTriggerCreate: true, properties: CARE_PROPERTIES, geminiResponses: [response(503, {})] });
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(result.retryScheduled, false);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+  assert.ok(h.calls.console.some(line => line.includes('再試行の予約を作成できません')));
+  assert.ok(!h.calls.console.some(line => line.includes('private-token')));
+});
+
+test('送信前のYouTube読取り503は安全に再確認できる', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const original = h.context.YouTube.Videos.list;
+  let first = true;
+  h.context.YouTube.Videos.list = (...args) => {
+    if (first) { first = false; throw new Error('503 backendError'); }
+    return original(...args);
+  };
+  const failed = h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(failed.retryScheduled, true);
+  assert.equal(h.calls.chats.length, 0);
+  h.advance(300000);
+  assert.equal(h.context.retryPersonalYouTube({ triggerUid: 'retry' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('24時間の全解析が503でも最大72試行と各時間枠の3試行を超えない', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-10T08:00:00Z'),
+    properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '72' },
+    geminiResponses: Array.from({ length: 72 }, () => response(503, {})) });
+  for (let hour = 0; hour < 24; hour++) {
+    h.context.analyzeLatestImageAndLog({ triggerUid: 'hour-' + hour });
+    h.advance(180000); h.context.retrySchoolAnalysis({ triggerUid: 'retry1-' + hour });
+    h.advance(300000); h.context.retrySchoolAnalysis({ triggerUid: 'retry2-' + hour });
+    if (hour < 23) h.advance(52 * 60000);
+  }
+  assert.equal(h.calls.gemini.length, 72);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 72);
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 72);
+});
+
+test('正常時の24時間は再試行予約を作らず毎時1回の解析で終わる', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-10T08:00:00Z'),
+    properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '72', ENABLE_FEELING_VARIATION: 'true' },
+    geminiResponses: Array.from({ length: 24 }, (_, i) => careResponse('ぼく、好き' + i)) });
+  for (let hour = 0; hour < 24; hour++) {
+    if (hour) h.advance(3600000);
+    assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'hour-' + hour }).status, 'prepared');
+  }
+  assert.equal(h.calls.gemini.length, 24);
+  assert.equal(h.calls.retryDelays.length, 0);
+});
+
+test('実行中に停止された処理は終了後に再試行を復活させない', () => {
+  const h = preparedSchool({ triggers: ['analyzeLatestImageAndLog'], properties: CARE_PROPERTIES, geminiResponses: [response(503, {})] });
+  const original = h.context.UrlFetchApp.fetch;
+  h.context.UrlFetchApp.fetch = (...args) => {
+    const response = original(...args); h.context.removeBotTriggers(); return response;
+  };
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.retryDelays.length, 0);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('遅れて投稿できた後も次の定期投稿は設定した60分を空ける', () => {
+  const school = preparedSchool({ now: Date.parse('2026-11-10T13:00:00Z'),
+    properties: { ...CARE_PROPERTIES, ...VARIATION_PROPERTIES },
+    geminiResponses: [careResponse('ぼく、この葉のふちが気になるな。'), careResponse('わたし、ここで体をゆるめたい気分。')] });
+  const h = personalWithPrepared(school, { now: school.now() });
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  school.advance(240000);
+  school.context.analyzeLatestImageAndLog();
+  h.values.YOSAN_STATE_V1 = school.values.YOSAN_STATE_V1;
+  h.values.YOSAN_LIMITS_V1 = school.values.YOSAN_LIMITS_V1;
+  h.advance(300000);
+  assert.equal(h.context.retryPersonalYouTube({ triggerUid: 'retry' }).youtube, 'sent');
+  school.values.YOSAN_STATE_V1 = h.values.YOSAN_STATE_V1;
+  school.values.YOSAN_LIMITS_V1 = h.values.YOSAN_LIMITS_V1;
+  school.advance(56 * 60000);
+  school.context.analyzeLatestImageAndLog();
+  h.values.YOSAN_STATE_V1 = school.values.YOSAN_STATE_V1;
+  h.values.YOSAN_LIMITS_V1 = school.values.YOSAN_LIMITS_V1;
+  h.advance(55 * 60000);
+  const waiting = h.context.postPreparedCommentToYouTube({ triggerUid: 'next-hour' });
+  assert.equal(waiting.status, 'rate_limited');
+  assert.equal(waiting.retryScheduled, true);
+  assert.equal(h.calls.chats.length, 1);
+  h.advance(300000);
+  assert.equal(h.context.retryPersonalYouTube({ triggerUid: 'retry2' }).youtube, 'sent');
+  assert.equal(h.calls.chats.length, 2);
+  assert.ok(h.calls.chats[1].at - h.calls.chats[0].at >= 3600000);
+});
+
+test('予約した時間枠内でも旧形式の解析を完了済みと扱わない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [response(503, {}), careResponse()] });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  h.values.YOSAN_STATE_V1 = JSON.stringify({ key: 'old', logged: true, feeling: 'ぼく、この葉が好き。',
+    youtube: 'pending', analysisVersion: 'rearing-grounded-v3', generatedAt: h.now() + 1000 });
+  h.advance(180000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.state().analysisVersion, 'rearing-scale-v4');
 });
