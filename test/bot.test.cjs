@@ -3161,3 +3161,50 @@ test('硬貨の根拠欄は未読を不明にし不正な型を拒否する', ()
     assert.throws(() => h.context.parseRearingResponse_(JSON.stringify({ ...data, coinReferenceText: value })), /硬貨/);
   }
 });
+
+test('報告された視聴者への呼びかけは一人称があっても採用せず追加生成しない', () => {
+  const text = '画面の向こうから見守ってくれているみんな、ぼくらの様子が見えるかな。';
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(text, {
+    stageText: '蚕3齢 (9日目)', temperatureText: '23.9 ℃', humidityText: '77.5 %',
+    coinReferenceText: '蚕たちの下に半分隠れるように硬貨が見える'
+  })] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  assert.ok(h.calls.console.some(line => line.includes('[observer_language]')));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.values.YOSAN_STATE_V1, undefined);
+  assert.equal(h.values.YOSAN_FEELING_HISTORY_V1, undefined);
+});
+
+test('従来視聴者を宛先にしていた文体候補でも本人の好みとして一度で準備できる', () => {
+  const feeling = 'わたし、この葉の形が好きだな。';
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_FEELING_VARIATION: 'true' },
+    geminiResponses: [careResponse(feeling)] });
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify({ gemini: { day: h.context.quotaDay_(), count: 4 } });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const request = JSON.parse(h.calls.gemini[0].request.payload);
+  const instruction = request.contents[0].parts[0].text;
+  assert.ok(!instruction.includes('配信を見ている人へ'));
+  assert.ok(instruction.includes('自分の小さな好み'));
+  assert.ok(instruction.includes('本人の好みや願望を含む自問'));
+  assert.ok(request.systemInstruction.parts[0].text.includes('本人の胸の中だけで完結する独白'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.state().feeling, feeling);
+  const personal = personalWithPrepared(h);
+  assert.ok(personal.context.previewPreparedComment().messageText.includes('こはく：' + feeling));
+  assert.equal(personal.calls.gemini.length, 0);
+});
+
+test('観察者の過去文は比較用プロンプトへ再投入せず元の履歴は保持する', () => {
+  const invalid = '画面の向こうから見守ってくれているみんな、ぼくらの様子が見えるかな。';
+  const valid = 'ぼく、この場所が好きだな。';
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_FEELING_VARIATION: 'true',
+    YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [invalid, valid] }) },
+    geminiResponses: [careResponse('わたし、体をゆるめて過ごしたい気分。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const request = JSON.parse(h.calls.gemini[0].request.payload);
+  assert.ok(!request.contents[0].parts[0].text.includes(invalid));
+  assert.ok(request.contents[0].parts[0].text.includes(valid));
+  assert.ok(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts.includes(invalid));
+  assert.equal(h.calls.gemini.length, 1);
+});
