@@ -10,7 +10,7 @@ const BOT_PREVIEW_KEY = 'YOSAN_PREVIEW_V1';
 const BOT_YOUTUBE_ERROR_KEY = 'YOSAN_YOUTUBE_LAST_ERROR_V1';
 const BOT_FEELING_HISTORY_KEY = 'YOSAN_FEELING_HISTORY_V1';
 const FEELING_HISTORY_SIZE = 8;
-const COIN_TOPIC_GAP = 4;
+const COIN_TOPIC_GAP = 4; // 硬貨・棒・定規など比較用の物に共通の間隔。保存済みカウンター名は互換性のため維持。
 const SCHEDULED_RETRY_PREFIX = 'YOSAN_RETRY_V1_';
 const SCHEDULED_MAX_ATTEMPTS = 3;
 const SCHEDULED_WINDOW_MS = 60 * 60000;
@@ -19,8 +19,8 @@ const DEFAULT_YOUTUBE_CHANNEL_ID = 'UCJ12W_V5k49jE0M38L32Ylg';
 const QUOTA_TIME_ZONE = 'America/Los_Angeles';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
-const REARING_ANALYSIS_VERSION = 'rearing-scale-v4';
-const LEGACY_ANALYSIS_VERSION = 'first-person-scale-v3';
+const REARING_ANALYSIS_VERSION = 'rearing-scale-v5';
+const LEGACY_ANALYSIS_VERSION = 'first-person-scale-v4';
 const DEFAULT_SILKWORM_NAMES = [
   "こはく",
   "まゆ",
@@ -680,10 +680,10 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
         temperatureText: { type: ['string', 'null'] },
         humidityText: { type: ['string', 'null'] },
         cleaningStatusText: { type: ['string', 'null'] },
-        coinReferenceText: { type: ['string', 'null'] },
+        scaleReferenceText: { type: ['string', 'null'] },
         feeling: { type: 'string' }
       },
-      required: ['stageText', 'temperatureText', 'humidityText', 'cleaningStatusText', 'coinReferenceText', 'feeling'],
+      required: ['stageText', 'temperatureText', 'humidityText', 'cleaningStatusText', 'scaleReferenceText', 'feeling'],
       additionalProperties: false
     };
   }
@@ -748,7 +748,7 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
     throw groundingMismatch_('repeated_cleaning', feeling);
   }
   validateCoinPostingInterval_(feeling);
-  if (isCoinFeeling_(feeling) && history.slice(-COIN_TOPIC_GAP).some(isCoinFeeling_)) {
+  if (isSizeReferenceFeeling_(feeling) && history.slice(-COIN_TOPIC_GAP).some(isSizeReferenceFeeling_)) {
     throw groundingMismatch_('repeated_coin_generation', feeling);
   }
   if (config.varyFeelings) {
@@ -931,7 +931,7 @@ function postLatestCommentToYouTube(feelingText, liveChatId, config, comment) {
   validateGroundedFeeling_(feelingText, config.rearingObservation || null);
   validateCoinPostingInterval_(feelingText);
   comment = comment || buildYouTubeComment_(feelingText, config);
-  reserveYouTubeUnits_(config, 50, true, isCoinFeeling_(feelingText));
+  reserveYouTubeUnits_(config, 50, true, isSizeReferenceFeeling_(feelingText));
   let result;
   try {
     result = YouTube.LiveChatMessages.insert({
@@ -947,7 +947,7 @@ function postLatestCommentToYouTube(feelingText, liveChatId, config, comment) {
   if (!result || !result.id) throw new Error('YouTube投稿の成功応答が確認できません。');
   const limits = getLimitState_();
   limits.youtube.lastText = feelingText;
-  limits.youtube.coinFreePosts = isCoinFeeling_(feelingText) ? 0 : Math.min(COIN_TOPIC_GAP, (limits.youtube.coinFreePosts || 0) + 1);
+  limits.youtube.coinFreePosts = isSizeReferenceFeeling_(feelingText) ? 0 : Math.min(COIN_TOPIC_GAP, (limits.youtube.coinFreePosts || 0) + 1);
   if (config.enableNamedComments) limits.youtube.nameSequence = comment.sequence + 1;
   saveLimitState_(limits);
   return result.id;
@@ -1647,6 +1647,12 @@ function diagnosePersonalYouTube() {
 
 
 /** 投稿間隔は各トリガーで1時間へ変更する。鍵・使用済み予算・投稿状態は維持する。 */
+/** 軽量モデルへの明示的な切替。APIの呼出し・キー表示・予算や待機の初期化はしない。 */
+function configureLowTokenGemini() {
+  PropertiesService.getScriptProperties().setProperty('GEMINI_MODEL', DEFAULT_GEMINI_MODEL);
+  console.log('軽量モデル ' + DEFAULT_GEMINI_MODEL + ' を指定しました。思考量minimal・出力上限・使用済み予算・保存済みの待機を維持します。');
+}
+
 function configureHourlyCommentary() {
   const properties = PropertiesService.getScriptProperties();
   properties.setProperty('ENABLE_FEELING_VARIATION', 'true');
@@ -1829,7 +1835,8 @@ function rearingPrompt_() {
     '危険域を快適・ちょうどよいと表現しない。眠や脱皮中に動かないことは病気と決めつけず、食べている描写をしない。' +
     '気持ちは写真で見える特徴をもとに擬人化し、食事や温湿度ばかりにせず、配置・仲間・居場所・独り言・問いかけなどを変える。' +
     'cleaningStatusTextには画像UIに清掃・掃除の作業状態が明示されている場合だけ、その表示をそのまま転記する。表示がない・読めない・写真からの推測だけならnull。' +
-    'coinReferenceTextには飼育領域に比較用の硬貨の実物が見える場合だけ、その見え方を短く書く。硬貨がない・判別できない場合はnull。チャットやUIにある硬貨の文字だけを根拠にしない。' +
+    'scaleReferenceTextには大きさ比較用の硬貨・棒・定規等の実物が見える場合だけ、その種類と見え方を短く書く。不明ならnull。チャットやUIの文字だけを根拠にしない。' +
+    '棒状の物が比較道具か餌か不明なら、餌・遊具・居場所と決めつけず、その物の話題を避ける。桑の葉・人工飼料は比較道具と混同しない。' +
     'feelingは挨拶・自己紹介・名前・日時なしの日本語本文だけ、70文字以内。飼育の操作指示や健康診断は書かない。';
 }
 
@@ -1875,6 +1882,10 @@ function parseRearingResponse_(text) {
       (typeof data.coinReferenceText !== 'string' || data.coinReferenceText.length > 120)) {
     throw new Error('Geminiの比較用硬貨の解析形式が不正です。');
   }
+  if (data.scaleReferenceText !== undefined && data.scaleReferenceText !== null &&
+      (typeof data.scaleReferenceText !== 'string' || data.scaleReferenceText.length > 120)) {
+    throw new Error('Geminiの比較用の物の解析形式が不正です。');
+  }
   const label = (data.stageText || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
   const instarValues = Array.from(label.matchAll(/([1-5一二三四五])\s*[令齢]/g))
     .map(function (match) { return japaneseDayNumber_(match[1]); });
@@ -1897,7 +1908,9 @@ function parseRearingResponse_(text) {
     temperatureText: data.temperatureText, temperatureC: readUiNumber_(data.temperatureText, 'temperature'),
     humidityText: data.humidityText, humidityPercent: readUiNumber_(data.humidityText, 'humidity'),
     cleaningStatusText: data.cleaningStatusText === undefined ? null : data.cleaningStatusText,
-    coinReferenceText: data.coinReferenceText === undefined ? null : data.coinReferenceText
+    coinReferenceText: data.coinReferenceText === undefined ? null : data.coinReferenceText,
+    scaleReferenceText: data.scaleReferenceText === undefined
+      ? data.coinReferenceText === undefined ? null : data.coinReferenceText : data.scaleReferenceText
   };
   observation.reference = rearingReference_(observation);
   return { feeling: data.feeling.replace(/\s+/g, ' ').trim(), observation: observation };
@@ -1953,32 +1966,52 @@ function isCoinFeeling_(feeling) {
   return /[1一]\s*円|コイン|こいん|coin|硬貨|銀色|(?:銀|金属).{0,8}(?:円盤|台座|板|上|縁|ふち)|(?:円盤|台座).{0,8}(?:銀|金属)|(?:つるつる|ツルツル).{0,8}金属|(?:丸い|かたい|固い|硬い).{0,5}台座/i.test(text);
 }
 
+/** 相棒や蚕自身の姿勢・葉の形を比較用の棒と誤判定しない。 */
+function scalePropKind_(value) {
+  const text = typeof value === 'string' ? value.normalize('NFKC') : '';
+  if (/定規|じょうぎ|物差し|ものさし|メジャー|巻尺/.test(text)) return 'ruler';
+  if (/(?:^|[^相])棒|スティック|竹串|爪楊枝|つまようじ/.test(text)) return 'rod';
+  if (/(?:比較用|サイズ比較|大きさ比較).{0,6}(?:目印|道具)|(?:黄色|きいろ|細長い|長細い).{0,5}(?:柱|物体|もの)/.test(text)) return 'marker';
+  return '';
+}
+
+function isSizeReferenceFeeling_(feeling) {
+  return isCoinFeeling_(feeling) || Boolean(scalePropKind_(feeling));
+}
+
+function scaleReferenceVisible_(feeling, observation) {
+  if (isCoinFeeling_(feeling)) return coinVisible_(observation);
+  const value = observation && observation.scaleReferenceText;
+  if (typeof value !== 'string' || /ない|無い|無し|ません|見当たら|不在|なし|不明|未確認|未検出|不確か|らしい|可能性|かもしれ|チャット|コメント|文字だけ/.test(value)) return false;
+  return Boolean(scalePropKind_(feeling)) && scalePropKind_(value) === scalePropKind_(feeling);
+}
+
 function coinVisible_(observation) {
-  const value = observation && observation.coinReferenceText;
+  const value = observation && (Object.prototype.hasOwnProperty.call(observation, 'scaleReferenceText')
+    ? observation.scaleReferenceText : observation.coinReferenceText);
   if (typeof value !== 'string') return false;
   const text = value.normalize('NFKC');
-  if (/ない|ません|見当たら|不在|なし|不明|不確か|らしい|可能性|かもしれ|チャット|コメント|文字だけ/.test(text)) return false;
+  if (/ない|無い|無し|ません|見当たら|不在|なし|不明|未確認|未検出|不確か|らしい|可能性|かもしれ|チャット|コメント|文字だけ/.test(text)) return false;
   return /[1一]\s*円|硬貨|コイン|こいん|coin/i.test(text);
 }
 
 function coinPostingBlocked_() {
   const row = getLimitState_().youtube;
-  return (row.coinFreePosts || 0) < COIN_TOPIC_GAP || isCoinFeeling_(row.lastText);
+  return (row.coinFreePosts || 0) < COIN_TOPIC_GAP || isSizeReferenceFeeling_(row.lastText);
 }
 
 function validateCoinPostingInterval_(feeling) {
-  if (isCoinFeeling_(feeling) && coinPostingBlocked_()) throw groundingMismatch_('repeated_coin_post', feeling);
+  if (isSizeReferenceFeeling_(feeling) && coinPostingBlocked_()) throw groundingMismatch_('repeated_coin_post', feeling);
 }
 
 function coinFeelingPrompt_(history) {
-  const avoid = coinPostingBlocked_() || history.slice(-COIN_TOPIC_GAP).some(isCoinFeeling_);
-  return '\n1円玉・硬貨・コインは体の大きさを伝える比較用の目印で、実況の主役にしない。' +
-    '硬貨を寝床・台座・お気に入りの場所・銀色のベッドとして扱わず、金属や円盤などへの言い換えで同じ話題を続けない。' +
-    '飼育領域の実物が見える場合だけ、今の体の大きさや長さを伝える比較に短く触れてよい。' +
-    '写真1枚から前より大きくなった等の成長、実際の体長や倍率を断定しない。硬貨がない画像で存在を引き継がない。' +
-    '硬貨の話題を避ける回も、蚕・葉・餌・姿勢などが見えていれば、その特徴から別の気持ちを作る。' +
-    (avoid ? '今回は硬貨の話題を使わず、蚕自身の姿勢・仲間との配置・葉の形など、別の見える特徴から気持ちを作る。' :
-      '硬貨に触れる場合も大きさ比較の補助として一言だけにし、それ以外の見える特徴を優先する。');
+  const avoid = coinPostingBlocked_() || history.slice(-COIN_TOPIC_GAP).some(isSizeReferenceFeeling_);
+  return '\n硬貨・1円玉・棒・定規などは大きさ比較用の物で、実況の主役にしない。原則は蚕自身・仲間・葉・餌・姿勢に着目する。' +
+    '棒や硬貨を寝床・台座・お気に入りの場所・遊具・餌として扱わず、黄色い柱や銀色のベッドなどへの言い換えでも同じ話題を続けない。' +
+    '実物と種類が確認できる場合だけ今の大きさ比較に短く触れてよい。棒状で用途不明ならその物の話題を避ける。' +
+    '写真1枚から過去との成長、実際の体長や倍率を断定せず、前の画像の物を引き継がない。' +
+    (avoid ? '今回は硬貨・棒・定規等の話題を使わず、別の見える特徴から気持ちを作る。' :
+      '比較用の物に触れられる回も、蚕自身の見える特徴を優先し、比較は補助の一言だけにする。');
 }
 
 function groundedFeelingPrompt_(history) {
@@ -2013,14 +2046,15 @@ function cleaningConfirmed_(observation) {
 }
 
 function validateGroundedFeeling_(feeling, observation) {
-  if (isCoinFeeling_(feeling)) {
-    if (!coinVisible_(observation)) throw groundingMismatch_('coin_not_visible', feeling);
+  if (isSizeReferenceFeeling_(feeling)) {
+    const coin = isCoinFeeling_(feeling);
+    if (!scaleReferenceVisible_(feeling, observation)) throw groundingMismatch_(coin ? 'coin_not_visible' : 'scale_not_visible', feeling);
     if (!/(大きさ|サイズ|長さ|体長|比べ|くらべ|比較|目安|ものさし|物差し)/.test(feeling) ||
-        /ベッド|寝床|枕|布団|舞台|台座|特等席|お気に入り|心地|居心地|くつろ|預け|横たわ|寝そべ|寄り添|乗[っるり]|載[っるり]/.test(feeling)) {
-      throw groundingMismatch_('coin_not_size_reference', feeling);
+        /ベッド|寝床|枕|布団|舞台|台座|特等席|お気に入り|心地|居心地|くつろ|預け|横たわ|寝そべ|寄り添|乗[っるり]|載[っるり]|遊び道具|すべり台|滑り台|トンネル|橋/.test(feeling)) {
+      throw groundingMismatch_(coin ? 'coin_not_size_reference' : 'scale_not_size_reference', feeling);
     }
     if (/(?:前回|以前|昨日|さっき|前より).{0,12}(?:大き|長|成長)|(?:大きく|長く)なった|成長した|育った|(?:\d+(?:\.\d+)?|[一二三四五六七八九十]+)\s*(?:mm|cm|ミリ|センチ|倍)/i.test(feeling.normalize('NFKC'))) {
-      throw groundingMismatch_('coin_unverified_growth', feeling);
+      throw groundingMismatch_(coin ? 'coin_unverified_growth' : 'scale_unverified_growth', feeling);
     }
   }
   if (hasUnsupportedStory_(feeling)) throw groundingMismatch_('unsupported_story', feeling);
@@ -2034,11 +2068,14 @@ function groundingMismatch_(reason, feeling) {
     unsupported_story: '一人・隔離・再会予定など、写真から確認できない設定',
     cleaning_not_confirmed: '画像UIで清掃中と確認できない掃除の話題',
     repeated_cleaning: '直近8件に掃除の話題があるため別の話題を待機',
+    scale_not_visible: '比較用の物の実物・種類を確認できない',
+    scale_not_size_reference: '比較用の物は寝床・遊具・お気に入りの場所として扱わない',
+    scale_unverified_growth: '画像1枚から過去との成長や体長・倍率を断定しない',
     coin_not_visible: '比較用硬貨の実物を確認できない',
     coin_not_size_reference: '硬貨は大きさの比較用で、寝床やお気に入りの場所として扱わない',
     coin_unverified_growth: '画像1枚から過去との成長や体長・倍率を断定しない',
-    repeated_coin_post: '硬貨の話題は別の話題の投稿が4回成功するまで待機',
-    repeated_coin_generation: '直近4件の生成文に硬貨の話題があるため別の話題を待機'
+    repeated_coin_post: '硬貨・棒・定規等の話題は別の話題の投稿が4回成功するまで待機',
+    repeated_coin_generation: '直近4件の生成文に比較用の物の話題があるため別の話題を待機'
   };
   const candidate = typeof feeling === 'string' ? shortenText_(feeling.replace(/\s+/g, ' '), MAX_FEELING_CHARS) : '';
   console.log('本文検査の見送り [' + reason + ']: ' + JSON.stringify(candidate));

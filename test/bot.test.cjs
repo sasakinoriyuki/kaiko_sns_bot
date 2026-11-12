@@ -1869,7 +1869,7 @@ test('飼育環境読取りは初期有効で同じ1回のAPIからUIと気持�
   assert.equal(h.state().rearing.humidityPercent, 79);
   assert.equal(h.state().rearing.reference.temperatureC, 29);
   assert.equal(h.state().rearing.reference.humidityPercent, 75);
-  assert.equal(h.state().analysisVersion, 'rearing-scale-v4');
+  assert.equal(h.state().analysisVersion, 'rearing-scale-v5');
 });
 
 test('1から5令の温度目安はUIの令に対応し4令の湿度を補わない', () => {
@@ -2017,7 +2017,7 @@ test('新解析形式では古いプレビューを再利用せず新しいUI情
   h.advance(3600000);
   assert.equal(h.context.previewSchoolAnalysis().status, 'preview');
   assert.equal(h.calls.gemini.length, 2);
-  assert.equal(JSON.parse(h.values.YOSAN_PREVIEW_V1).analysisVersion, 'rearing-scale-v4');
+  assert.equal(JSON.parse(h.values.YOSAN_PREVIEW_V1).analysisVersion, 'rearing-scale-v5');
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.calls.gemini.length, 2);
   assert.equal(h.state().rearing.instarDay, 3);
@@ -2083,7 +2083,7 @@ test('一括処理の初期有効モードもUIを読み日付名前付き本文
   const h = harness({ properties: { ENABLE_REARING_CONTEXT: undefined, ENABLE_NAMED_COMMENTS: 'true' },
     geminiResponses: [careResponse()] });
   assert.equal(h.run().youtube, 'sent');
-  assert.equal(h.state().analysisVersion, 'rearing-scale-v4');
+  assert.equal(h.state().analysisVersion, 'rearing-scale-v5');
   assert.equal(h.state().rearing.instar, 1);
   assert.equal(h.state().rearing.reference.temperatureC, 29);
   assert.ok(h.calls.chats[0].payload.snippet.textMessageDetails.messageText.includes('\nこはく：'));
@@ -2973,6 +2973,7 @@ function setPendingFeeling(h, feeling) {
   const state = h.state();
   state.youtube = 'pending'; state.feeling = feeling;
   state.rearing.coinReferenceText = COIN_UI.coinReferenceText;
+  state.rearing.scaleReferenceText = COIN_UI.coinReferenceText;
   h.values.YOSAN_STATE_V1 = JSON.stringify(state);
 }
 
@@ -2983,8 +2984,8 @@ test('実物の一円玉は現在の体の大きさの比較としてだけ採�
   assert.equal(h.state().rearing.coinReferenceText, COIN_UI.coinReferenceText);
   assert.equal(h.state().feeling, COIN_FEELING);
   const request = JSON.parse(h.calls.gemini[0].request.payload);
-  assert.ok(request.generationConfig.responseJsonSchema.required.includes('coinReferenceText'));
-  assert.ok(request.systemInstruction.parts[0].text.includes('比較用の目印'));
+  assert.ok(request.generationConfig.responseJsonSchema.required.includes('scaleReferenceText'));
+  assert.ok(request.systemInstruction.parts[0].text.includes('大きさ比較用の物'));
   assert.ok(request.systemInstruction.parts[0].text.includes('過去のチャット'));
   assert.equal(h.calls.gemini.length, 1);
 });
@@ -3021,7 +3022,7 @@ test('コインが写っていても通常の蚕の気持ちを優先しコイ�
   const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('ぼく、この葉のふちが気になるな。', COIN_UI)] });
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   const request = JSON.parse(h.calls.gemini[0].request.payload);
-  assert.ok(request.systemInstruction.parts[0].text.includes('今回は硬貨の話題を使わず'));
+  assert.ok(request.systemInstruction.parts[0].text.includes('今回は硬貨・棒・定規等の話題を使わず'));
   assert.equal(h.state().feeling, 'ぼく、この葉のふちが気になるな。');
   assert.equal(h.calls.gemini.length, 1);
 });
@@ -3498,7 +3499,7 @@ test('予約した時間枠内でも旧形式の解析を完了済みと扱わ�
   h.advance(180000);
   assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
   assert.equal(h.calls.gemini.length, 2);
-  assert.equal(h.state().analysisVersion, 'rearing-scale-v4');
+  assert.equal(h.state().analysisVersion, 'rearing-scale-v5');
 });
 
 
@@ -3651,4 +3652,166 @@ test('毎分429の記録が残っていても後の503を毎分制限と誤表�
   const waiting = h.context.analyzeLatestImageAndLog();
   assert.ok(waiting.reason.includes('再実行待ち'));
   assert.ok(!waiting.reason.includes('毎分の制限'));
+});
+
+const ROD_UI = { scaleReferenceText: '蚕のそばに比較用の黄色い棒が見える' };
+const ROD_FEELING = '棒と比べてぼくの体の長さが伝わるとうれしいな。';
+
+test('軽量モデル切替は3.5FlashLiteだけを指定しキー・unknown・予算・待機を維持する', () => {
+  const h = preparedSchool({ properties: { GEMINI_MODEL: 'gemini-3.6-flash', GEMINI_DAILY_REQUEST_BUDGET: '72',
+    YOSAN_STATE_V1: '{"youtube":"unknown"}', YOSAN_LIMITS_V1: '{"gemini":{"count":12,"cooldownUntil":1999999999999},"youtube":{"nameSequence":9,"coinFreePosts":2}}' } });
+  const before = { ...h.values };
+  h.context.configureLowTokenGemini();
+  assert.deepEqual(h.values, { ...before, GEMINI_MODEL: 'gemini-3.5-flash-lite' });
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  assert.ok(!h.calls.console.join(' ').includes('test-gemini-key'));
+});
+
+test('軽量モデルも画像UIと気持ちを同じ1回で取得しminimalと512トークン上限を維持する', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  h.context.configureLowTokenGemini();
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const call = h.calls.gemini[0], payload = JSON.parse(call.request.payload);
+  assert.ok(call.url.endsWith('/gemini-3.5-flash-lite:generateContent'));
+  assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
+  assert.equal(payload.generationConfig.maxOutputTokens, 512);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.state().analysisVersion, 'rearing-scale-v5');
+});
+
+test('実物の棒は大きさ比較に限り低頻度で使い道具を主役にしない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(ROD_FEELING, ROD_UI)] });
+  setCoinGap(h, 4);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().rearing.scaleReferenceText, ROD_UI.scaleReferenceText);
+  assert.equal(h.state().feeling, ROD_FEELING);
+  const payload = JSON.parse(h.calls.gemini[0].request.payload);
+  assert.ok(payload.generationConfig.responseJsonSchema.required.includes('scaleReferenceText'));
+  assert.ok(!payload.generationConfig.responseJsonSchema.required.includes('coinReferenceText'));
+  assert.ok(payload.systemInstruction.parts[0].text.includes('棒状の物が比較道具か餌か不明'));
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('棒・定規・黄色い柱を寝床や遊び道具にする気持ちは採用しない', () => {
+  const examples = [
+    ['ぼく、黄色い棒のそばがお気に入りの場所なんだ。', ROD_UI],
+    ['ぼく、棒を枕にしてくつろぎたいな。', ROD_UI],
+    ['ぼく、この棒を橋にして遊びたいな。', ROD_UI],
+    ['ぼく、定規の上が心地よくて好き。', { scaleReferenceText: '比較用の定規が見える' }],
+    ['ぼく、黄色い柱をベッドにしたいな。', { scaleReferenceText: '比較用の黄色い柱が見える' }]
+  ];
+  for (const [feeling, ui] of examples) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling, ui)] });
+    setCoinGap(h, 4);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+    assert.equal(h.calls.logs.length, 0);
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('比較用の物の実物が不明・別種類・過去チャットだけならその話題を使わない', () => {
+  for (const scaleReferenceText of [null, '棒はありません', '棒は無い', '棒無し', '棒は未確認', '棒らしい物がある', '棒か人工飼料か不明',
+    'チャットに棒という文字だけがある', '比較用の定規が見える', '一円玉の実物が見える']) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(ROD_FEELING, { scaleReferenceText })] });
+    setCoinGap(h, 4);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+    assert.ok(h.calls.console.some(line => line.includes('[scale_not_visible]')));
+    assert.equal(h.calls.logs.length, 0);
+  }
+});
+
+test('コインと棒を交互にしても比較物以外の成功投稿を4回はさむまで再投稿できない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(ROD_FEELING, ROD_UI)] });
+  setCoinGap(school, 4); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, 0);
+  h.advance(3600000);
+  setPendingFeeling(h, COIN_FEELING);
+  h.context.postPreparedCommentToYouTube();
+  assert.equal(h.calls.chats.length, 1);
+  const others = ['ぼく、この葉っぱのふちが好きだな。', 'わたし、仲間のそばでのんびりしたい。',
+    'ぼく、この場所で体をゆるめたい気分。', 'わたし、くねった葉っぱの形が気になるな。'];
+  others.forEach((feeling, i) => {
+    const state = h.state(); state.youtube = 'pending'; state.feeling = feeling;
+    h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+    assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+    assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, i + 1);
+    h.advance(3600000);
+  });
+  setPendingFeeling(h, COIN_FEELING);
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.calls.chats.length, 6);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, 0);
+});
+
+test('棒の話題も成功不明時は間隔を0に保ち自動再送しない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(ROD_FEELING, ROD_UI)] });
+  setCoinGap(school, 4); school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { chatFailure: new Error('insert timeout') });
+  h.context.postPreparedCommentToYouTube({ triggerUid: 'personal' });
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, 0);
+  assert.equal(h.calls.retryDelays.length, 0);
+  h.advance(3600000);
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'unknown');
+  assert.equal(h.calls.chats.length, 1);
+});
+
+test('生成履歴も硬貨と棒を共通の話題として直近4件を確認する', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(COIN_FEELING, COIN_UI), careResponse(ROD_FEELING, ROD_UI)] });
+  setCoinGap(h, 4);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+  assert.ok(h.calls.console.some(line => line.includes('[repeated_coin_generation]')));
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('餌・葉・仲間についての普通の文を比較道具の話題と誤判定しない', () => {
+  const h = preparedSchool();
+  for (const feeling of ['ぼく、桑の葉の長いふちが好きだな。', 'ぼく、細切りの人工飼料が好き。', 'ぼく、相棒のそばでのんびりしたい。', 'わたし、葉っぱの形が気になるな。']) {
+    assert.equal(h.context.isSizeReferenceFeeling_(feeling), false);
+  }
+  for (const feeling of ['ぼく、棒が気になる。', 'ぼく、定規のそばが好き。', '黄色い柱がぼくのお気に入り。', COIN_FEELING]) {
+    assert.equal(h.context.isSizeReferenceFeeling_(feeling), true);
+  }
+});
+
+test('比較物の解析欄は型を検査し新しい不明の根拠を旧硬貨欄で補わない', () => {
+  const h = preparedSchool();
+  const data = { stageText: null, temperatureText: null, humidityText: null, feeling: COIN_FEELING,
+    scaleReferenceText: null, coinReferenceText: COIN_UI.coinReferenceText };
+  const parsed = h.context.parseRearingResponse_(JSON.stringify(data));
+  assert.equal(h.context.coinVisible_(parsed.observation), false);
+  for (const value of [true, {}, '棒'.repeat(121)]) {
+    assert.throws(() => h.context.parseRearingResponse_(JSON.stringify({ ...data, scaleReferenceText: value })), /比較用/);
+  }
+});
+
+test('旧形式の棒に偏った解析・プレビューはそのまま投稿せず再解析を待つ', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse()] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school);
+  const state = h.state(); state.analysisVersion = 'rearing-scale-v4'; state.feeling = 'ぼく、棒のそばがお気に入り。';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  assert.equal(h.context.previewPreparedComment().status, 'waiting_analysis');
+  assert.equal(h.context.postPreparedCommentToYouTube().status, 'waiting_analysis');
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('棒や定規が見えていても一枚の写真で成長・実寸・倍率を断定しない', () => {
+  for (const [feeling, ui] of [
+    ['棒と比べると、ぼく昨日より大きくなってうれしいな。', ROD_UI],
+    ['棒と比べたぼくの体長は3cm、うれしいな。', ROD_UI],
+    ['定規と比べたぼくの長さは2倍でうれしいな。', { scaleReferenceText: '比較用の定規が見える' }]
+  ]) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling, ui)] });
+    setCoinGap(h, 4);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+    assert.ok(h.calls.console.some(line => line.includes('[scale_unverified_growth]')));
+    assert.equal(h.calls.logs.length, 0);
+  }
 });
