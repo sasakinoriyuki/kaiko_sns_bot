@@ -382,7 +382,10 @@ function quotaDay_() {
 
 function checkCooldown_(row, label) {
   if ((row.cooldownUntil || 0) > Date.now()) {
-    const error = waitError_(label + 'の再実行待ちです。次回: ' +
+    const quota = label === 'Gemini' && row.lastQuota && row.lastQuota.until === row.cooldownUntil ? row.lastQuota : null;
+    const reasons = { minute: '毎分の制限', daily: '1日の割当上限', unavailable: '利用枠が0', unknown: '制限の種類を判別できない429' };
+    const reason = quota && reasons[quota.kind] ? '（' + reasons[quota.kind] + '）' : '';
+    const error = waitError_(label + 'の再実行待ち' + reason + 'です。次回: ' +
       Utilities.formatDate(new Date(row.cooldownUntil), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降');
     error.retryAt = row.cooldownUntil;
     throw error;
@@ -596,6 +599,45 @@ function detectImageMime_(bytes) {
   throw new Error('画像の内容がPNG/JPEGではありません。拡張子と実ファイルを確認してください。');
 }
 
+/** 429の構造化された割当情報だけで待機を判断する。生のエラー本文・キーは保存しない。 */
+function geminiQuotaError_(response, config) {
+  let details = [];
+  try {
+    const body = response.getContentText();
+    const data = typeof body === 'string' && body.length <= 32768 ? JSON.parse(body) : null;
+    if (data && data.error && Array.isArray(data.error.details)) details = data.error.details;
+  } catch (ignored) {}
+  const violations = [];
+  details.forEach(function (detail) {
+    if (detail && detail['@type'] === 'type.googleapis.com/google.rpc.QuotaFailure' && Array.isArray(detail.violations)) {
+      detail.violations.forEach(function (violation) { violations.push(violation); });
+    }
+  });
+  const quotaId = function (violation) { return violation && typeof violation.quotaId === 'string' ? violation.quotaId : ''; };
+  const daily = violations.some(function (violation) { return /PerDay|per_day/i.test(quotaId(violation)); });
+  const unavailable = violations.some(function (violation) { return violation && String(violation.quotaValue) === '0'; });
+  const minute = violations.length > 0 && violations.every(function (violation) { return /PerMinute|per_minute/i.test(quotaId(violation)); });
+  const kind = unavailable ? 'unavailable' : daily ? 'daily' : minute ? 'minute' : 'unknown';
+  // 日次上限・枠0・不明は従来の慎重な待機を維持。毎分と確認できた場合だけ短く待つ。
+  let until = responseResetAt_(response, kind === 'minute' ? Date.now() + 2 * 60000 : nextQuotaReset_() + 60000);
+  details.forEach(function (detail) {
+    if (!detail || detail['@type'] !== 'type.googleapis.com/google.rpc.RetryInfo' || typeof detail.retryDelay !== 'string' ||
+        !/^\d+(?:\.\d{1,9})?s$/.test(detail.retryDelay)) return;
+    const delay = Math.ceil(Number(detail.retryDelay.slice(0, -1)) * 1000);
+    if (Number.isSafeInteger(delay) && Number.isSafeInteger(Date.now() + delay)) until = Math.max(until, Date.now() + delay);
+  });
+  const limits = getLimitState_();
+  const row = limits.gemini;
+  row.cooldownUntil = Math.max(row.cooldownUntil || 0, until);
+  row.lastQuota = { kind: kind, model: config.geminiModel, at: Date.now(), until: row.cooldownUntil };
+  saveLimitState_(limits);
+  const reasons = { minute: '毎分の制限', daily: '1日の割当上限', unavailable: '利用枠が0。AI Studioのモデル利用枠を確認', unknown: '制限の種類を判別できないため日次更新まで待機' };
+  const error = waitError_('Gemini API HTTP 429（' + reasons[kind] + '）。次回: ' +
+    Utilities.formatDate(new Date(row.cooldownUntil), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降');
+  error.retryAt = row.cooldownUntil;
+  return error;
+}
+
 function analyzeImageWithGemini(base64Data, mimeType, config) {
   config = config || getConfig_();
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + config.geminiModel + ':generateContent';
@@ -659,10 +701,7 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
     throw transientGeminiError_('Geminiへの接続に失敗しました。', retryAt);
   }
   const code = response.getResponseCode();
-  if (code === 429) {
-    setCooldown_('gemini', Math.max(nextQuotaReset_(), responseResetAt_(response, Date.now() + 60000)) + 60000);
-    throw waitError_('Gemini API HTTP 429。次の割当日まで自動実行を待機します。');
-  }
+  if (code === 429) throw geminiQuotaError_(response, config);
   if (code >= 500) {
     const retryAt = responseResetAt_(response, Date.now() + 3 * 60000);
     setCooldown_('gemini', retryAt);

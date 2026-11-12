@@ -3500,3 +3500,155 @@ test('予約した時間枠内でも旧形式の解析を完了済みと扱わ�
   assert.equal(h.calls.gemini.length, 2);
   assert.equal(h.state().analysisVersion, 'rearing-scale-v4');
 });
+
+
+const quotaResponse = (violations, retryDelay, headers = {}) => response(429, {
+  error: { message: 'private-error-body test-gemini-key', details: [
+    { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations },
+    ...(retryDelay === undefined ? [] : [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay }])
+  ] }
+}, headers);
+
+test('毎分制限だけの429なら日次更新まで止めず2分後の自動解析で復帰する', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-12T02:41:31Z'), properties: CARE_PROPERTIES,
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }], '30s'), careResponse()] });
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  assert.equal(result.status, 'rate_limited');
+  assert.equal(result.retryScheduled, true);
+  assert.equal(result.retryAt, h.now() + 120000);
+  assert.ok(result.reason.includes('毎分の制限'));
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.lastQuota.kind, 'minute');
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
+  assert.deepEqual(h.calls.sleeps, []);
+});
+
+test('日次上限を含む429は短いRetryInfoがあっても17時の日次境界まで待つ', () => {
+  const h = preparedSchool({ now: Date.parse('2026-11-12T02:41:31Z'), properties: CARE_PROPERTIES,
+    geminiResponses: [quotaResponse([
+      { quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' },
+      { quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }
+    ], '30s')] });
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  assert.equal(result.retryScheduled, undefined);
+  assert.ok(result.reason.includes('1日の割当上限'));
+  assert.ok(result.retryAt >= Date.parse('2026-11-12T08:01:00Z'));
+  assert.ok(result.retryAt < Date.parse('2026-11-12T08:01:01Z'));
+  h.advance(3 * 3600000);
+  const waiting = h.context.analyzeLatestImageAndLog({ triggerUid: 'later' });
+  assert.ok(waiting.reason.includes('1日の割当上限'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.retryDelays.length, 0);
+});
+
+test('毎分制限でもRetry-Afterと小数秒のRetryInfoより早く再実行しない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    quotaResponse([{ quotaId: 'GenerateContentInputTokensPerModelPerMinute-FreeTier' }], '1200.25s', { 'Retry-After': '900' }), careResponse()
+  ] });
+  const started = h.now();
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  assert.equal(result.retryAt, started + 1200250);
+  assert.equal(result.retryScheduled, true);
+  h.advance(20 * 60000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'early' }).status, 'retry_wait');
+  assert.equal(h.calls.gemini.length, 1);
+  h.advance(60000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'due' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('利用枠0の429では毎分の割当名でも短い再試行を増やさない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaValue: '0' }], '5s')
+  ] });
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  assert.equal(result.retryScheduled, undefined);
+  assert.ok(result.reason.includes('利用枠が0'));
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.lastQuota.kind, 'unavailable');
+  assert.equal(h.calls.retryDelays.length, 0);
+});
+
+test('不明な429や不正本文では推測で日次待機を短縮せず生レスポンスも保存しない', () => {
+  for (const reply of [response(429, 'private-invalid-body'), quotaResponse([{ quotaId: 'UnknownLimit' }], '2s'),
+    quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }, {}], '2s')]) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [reply] });
+    const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+    assert.equal(result.retryScheduled, undefined);
+    assert.ok(result.reason.includes('判別できない'));
+    const saved = h.values.YOSAN_LIMITS_V1;
+    assert.ok(!saved.includes('private'));
+    assert.ok(!saved.includes('test-gemini-key'));
+    assert.ok(!h.calls.console.join(' ').includes('private'));
+    assert.ok(!h.calls.console.join(' ').includes('test-gemini-key'));
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('手動解析も毎分429の待機を守るが自動の再試行予約は作らない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }], '30s'), careResponse()
+  ] });
+  const result = h.context.analyzeLatestImageAndLog();
+  assert.equal(result.status, 'rate_limited');
+  assert.equal(h.calls.retryDelays.length, 0);
+  const saved = h.values.YOSAN_LIMITS_V1;
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.values.YOSAN_LIMITS_V1, saved);
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('旧版の長い待機はモデルを変更しても根拠なく解除せず使用済み予算を維持する', () => {
+  const now = Date.parse('2026-11-12T02:41:31Z');
+  const limits = JSON.stringify({ gemini: { day: '2026-11-11', count: 12, cooldownUntil: Date.parse('2026-11-12T08:01:00Z') },
+    youtube: { nameSequence: 9, coinFreePosts: 2 }, instagram: { count: 1 } });
+  const h = preparedSchool({ now, properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.6-flash', YOSAN_LIMITS_V1: limits } });
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' }).status, 'rate_limited');
+  h.values.GEMINI_MODEL = 'gemini-3.8-flash';
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly2' }).status, 'rate_limited');
+  assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('毎分429の再試行でもBOTの1日予算を増やさず上限到達で終了する', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '1' },
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }], '2s'), careResponse()] });
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' }).retryScheduled, true);
+  h.advance(120000);
+  const result = h.context.retrySchoolAnalysis({ triggerUid: 'retry' });
+  assert.equal(result.status, 'rate_limited');
+  assert.ok(result.reason.includes('1日予算'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('429の種類を記録しても指定済み3.6Flashとminimalの思考量を変更しない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.6-flash' },
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }], '2s'), careResponse()] });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  h.advance(120000);
+  h.context.retrySchoolAnalysis({ triggerUid: 'retry' });
+  for (const call of h.calls.gemini) {
+    assert.ok(call.url.endsWith('/gemini-3.6-flash:generateContent'));
+    const payload = JSON.parse(call.request.payload);
+    assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
+    assert.equal(payload.generationConfig.maxOutputTokens, 512);
+  }
+  assert.equal(h.values.GEMINI_MODEL, 'gemini-3.6-flash');
+});
+
+test('毎分429の記録が残っていても後の503を毎分制限と誤表示しない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }], '2s'), response(503, {})
+  ] });
+  h.context.analyzeLatestImageAndLog();
+  h.advance(120000);
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), /HTTP 503/);
+  const waiting = h.context.analyzeLatestImageAndLog();
+  assert.ok(waiting.reason.includes('再実行待ち'));
+  assert.ok(!waiting.reason.includes('毎分の制限'));
+});
