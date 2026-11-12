@@ -266,7 +266,7 @@ function getConfig_(analysisOnly) {
     enableInstagram: booleanProperty_(values, 'ENABLE_INSTAGRAM', false),
     instagramDailyBudget: integerBudgetProperty_(values, 'INSTAGRAM_DAILY_POST_BUDGET', 1),
     searchIntervalMinutes: positiveNumberProperty_(values, 'LIVE_SEARCH_INTERVAL_MINUTES', 60),
-    geminiDailyBudget: integerBudgetProperty_(values, 'GEMINI_DAILY_REQUEST_BUDGET', 48),
+    geminiDailyBudget: integerBudgetProperty_(values, 'GEMINI_DAILY_REQUEST_BUDGET', 48, true),
     youtubeDailyBudget: integerBudgetProperty_(values, 'YOUTUBE_DAILY_UNIT_BUDGET', 8000),
     youtubeMinMinutes: positiveNumberProperty_(values, 'YOUTUBE_MIN_INTERVAL_MINUTES', 30),
     xMinMinutes: positiveNumberProperty_(values, 'X_MIN_INTERVAL_MINUTES', 30),
@@ -327,7 +327,8 @@ function positiveNumberProperty_(values, name, fallback) {
   return value;
 }
 
-function integerBudgetProperty_(values, name, fallback) {
+function integerBudgetProperty_(values, name, fallback, allowZero) {
+  if (allowZero && values[name] !== undefined && String(values[name]).trim() === '0') return 0;
   const number = positiveNumberProperty_(values, name, fallback);
   if (!Number.isSafeInteger(number)) throw new Error(name + ' は正の整数を指定してください。');
   return number;
@@ -352,6 +353,27 @@ function getLimitState_() {
       }
     });
   });
+  const gemini = state.gemini;
+  if (gemini.cooldownSource !== undefined && ['quota', 'service'].indexOf(gemini.cooldownSource) === -1) {
+    throw new Error('BOTのGemini待機の種類が不正です。');
+  }
+  if (gemini.quotaWaits !== undefined) {
+    if (!gemini.quotaWaits || Array.isArray(gemini.quotaWaits) || typeof gemini.quotaWaits !== 'object') throw new Error('BOTのGemini待機記録が不正です。');
+    Object.keys(gemini.quotaWaits).forEach(function (key) {
+      const wait = gemini.quotaWaits[key];
+      if (!/^(?:project|model:[a-zA-Z0-9._-]{1,128})$/.test(key) || !wait || Array.isArray(wait) ||
+          !Number.isSafeInteger(wait.until) || wait.until < 0 || !Number.isSafeInteger(wait.at) || wait.at < 0 ||
+          ['minute', 'daily', 'unavailable', 'unknown'].indexOf(wait.kind) === -1 ||
+          ['project', 'model'].indexOf(wait.scope) === -1 ||
+          typeof wait.model !== 'string' || !/^[a-zA-Z0-9._-]{1,128}$/.test(wait.model) ||
+          (key === 'project' ? wait.scope !== 'project' : wait.scope !== 'model' || key !== 'model:' + wait.model)) {
+        throw new Error('BOTのGemini待機記録が不正です。');
+      }
+    });
+  }
+  if (gemini.cooldownSource === 'quota' && (!gemini.quotaWaits || !Object.keys(gemini.quotaWaits).length)) {
+    throw new Error('BOTのGemini待機記録がありません。');
+  }
   if (state.youtube.coinFreePosts !== undefined && state.youtube.coinFreePosts > COIN_TOPIC_GAP) {
     throw new Error('BOTの制限状態のコイン話題の間隔が不正です。' + BOT_LIMITS_KEY + ' を確認してください。');
   }
@@ -380,12 +402,12 @@ function quotaDay_() {
   return Utilities.formatDate(new Date(), QUOTA_TIME_ZONE, 'yyyy-MM-dd');
 }
 
-function checkCooldown_(row, label) {
+function checkCooldown_(row, label, model) {
   if ((row.cooldownUntil || 0) > Date.now()) {
     const quota = label === 'Gemini' && row.lastQuota && row.lastQuota.until === row.cooldownUntil ? row.lastQuota : null;
     const reasons = { minute: '毎分の制限', daily: '1日の割当上限', unavailable: '利用枠が0', unknown: '制限の種類を判別できない429' };
-    const reason = quota && reasons[quota.kind] ? '（' + reasons[quota.kind] + '）' : '';
-    const error = waitError_(label + 'の再実行待ち' + reason + 'です。次回: ' +
+    const reason = quota && reasons[quota.kind] ? '（' + reasons[quota.kind] + (quota.scope === 'project' ? '・モデル共通の待機' : '') + '）' : '';
+    const error = waitError_(label + (model ? ' [' + model + ']' : '') + 'の再実行待ち' + reason + 'です。次回: ' +
       Utilities.formatDate(new Date(row.cooldownUntil), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降');
     error.retryAt = row.cooldownUntil;
     throw error;
@@ -397,15 +419,29 @@ function resetDailyCounter_(row) {
   if (row.day !== day) { row.day = day; row.count = 0; }
 }
 
+function geminiPreviewInterval_(budget) {
+  return budget === 0 ? 1 : Math.max(10, 1440 / budget);
+}
+
+/** モデル別の待機はそのモデルだけに適用し、プロジェクト全体・通信障害の待機は共有する。 */
+function checkGeminiCooldown_(row, model) {
+  if (row.cooldownSource !== 'quota') checkCooldown_(row, 'Gemini', model);
+  const waits = row.quotaWaits || {};
+  const applicable = [waits.project, waits['model:' + model]].filter(function (wait) { return wait && wait.until > Date.now(); });
+  if (!applicable.length) return;
+  const wait = applicable.reduce(function (latest, item) { return item.until > latest.until ? item : latest; });
+  checkCooldown_({ cooldownUntil: wait.until, lastQuota: wait }, 'Gemini', model);
+}
+
 function reserveGeminiAttempt_(config) {
   const state = getLimitState_();
   const row = state.gemini;
-  checkCooldown_(row, 'Gemini');
+  checkGeminiCooldown_(row, config.geminiModel);
   resetDailyCounter_(row);
-  if ((row.count || 0) >= config.geminiDailyBudget) throw waitError_('GeminiのBOT用1日予算に達したため待機します。');
+  if (config.geminiDailyBudget > 0 && (row.count || 0) >= config.geminiDailyBudget) throw waitError_('GeminiのBOT用1日予算に達したため待機します。');
   // 自動解析はトリガー周期、学校の明示的な手動更新も最短1分。全試行を同じ日次予算に数える。
   // 解析プレビュー等の手動実行は、従来の予算の均等配分を維持する。
-  const interval = (config.triggerDriven || config.manualAnalysisRefresh ? 1 : Math.max(10, 1440 / config.geminiDailyBudget)) * 60000;
+  const interval = (config.triggerDriven || config.manualAnalysisRefresh ? 1 : geminiPreviewInterval_(config.geminiDailyBudget)) * 60000;
   if (row.lastAttempt && Date.now() - row.lastAttempt < interval) {
     const nextAttempt = row.lastAttempt + interval;
     const error = waitError_('Geminiの解析間隔を空けるため待機します。次回: ' +
@@ -473,7 +509,10 @@ function reserveXAttempt_(config, text) {
 
 function setCooldown_(platform, until) {
   const state = getLimitState_();
-  state[platform].cooldownUntil = Math.max(state[platform].cooldownUntil || 0, until);
+  const row = state[platform];
+  const previous = platform === 'gemini' && row.cooldownSource === 'quota' ? 0 : row.cooldownUntil || 0;
+  row.cooldownUntil = Math.max(previous, until);
+  if (platform === 'gemini') row.cooldownSource = 'service';
   saveLimitState_(state);
 }
 
@@ -531,7 +570,8 @@ function showBotUsage() {
   const report = {
     model: config.geminiModel,
     geminiDailyBudget: config.geminiDailyBudget,
-    geminiMinMinutes: Math.max(10, 1440 / config.geminiDailyBudget),
+    geminiDailyLimitDisabled: config.geminiDailyBudget === 0,
+    geminiMinMinutes: geminiPreviewInterval_(config.geminiDailyBudget),
     schoolManualAnalysisMinMinutes: 1,
     geminiIntervalNote: '学校のanalyzeLatestImageAndLogの手動更新は1分。geminiMinMinutesは解析プレビュー等の従来の手動間隔。全試行を同じ日次予算に数える。',
     youtubeMinMinutes: config.youtubeMinMinutes,
@@ -618,8 +658,10 @@ function geminiQuotaError_(response, config) {
   const unavailable = violations.some(function (violation) { return violation && String(violation.quotaValue) === '0'; });
   const minute = violations.length > 0 && violations.every(function (violation) { return /PerMinute|per_minute/i.test(quotaId(violation)); });
   const kind = unavailable ? 'unavailable' : daily ? 'daily' : minute ? 'minute' : 'unknown';
-  // 日次上限・枠0・不明は従来の慎重な待機を維持。毎分と確認できた場合だけ短く待つ。
-  let until = responseResetAt_(response, kind === 'minute' ? Date.now() + 2 * 60000 : nextQuotaReset_() + 60000);
+  // 上限0では不明な429を日次上限と推測せず、短い待機で再確認する。APIの長い指示は常に優先。
+  const unknownRetry = kind === 'unknown' && config.geminiDailyBudget === 0;
+  const fallback = kind === 'minute' ? Date.now() + 2 * 60000 : unknownRetry ? Date.now() + 3 * 60000 : nextQuotaReset_() + 60000;
+  let until = responseResetAt_(response, fallback);
   details.forEach(function (detail) {
     if (!detail || detail['@type'] !== 'type.googleapis.com/google.rpc.RetryInfo' || typeof detail.retryDelay !== 'string' ||
         !/^\d+(?:\.\d{1,9})?s$/.test(detail.retryDelay)) return;
@@ -628,11 +670,25 @@ function geminiQuotaError_(response, config) {
   });
   const limits = getLimitState_();
   const row = limits.gemini;
-  row.cooldownUntil = Math.max(row.cooldownUntil || 0, until);
-  row.lastQuota = { kind: kind, model: config.geminiModel, at: Date.now(), until: row.cooldownUntil };
+  const modelScoped = violations.length > 0 && violations.every(function (violation) {
+    const dimension = violation && violation.quotaDimensions && violation.quotaDimensions.model;
+    return /PerModel/i.test(quotaId(violation)) && (dimension === undefined || dimension === config.geminiModel);
+  });
+  const scope = modelScoped ? 'model' : 'project';
+  const key = modelScoped ? 'model:' + config.geminiModel : 'project';
+  row.quotaWaits = row.quotaWaits || {};
+  Object.keys(row.quotaWaits).forEach(function (name) {
+    if (row.quotaWaits[name].until <= Date.now()) delete row.quotaWaits[name];
+  });
+  const wait = { kind: kind, scope: scope, model: config.geminiModel, at: Date.now(),
+    until: Math.max(row.quotaWaits[key] && row.quotaWaits[key].until || 0, until) };
+  row.quotaWaits[key] = wait;
+  row.cooldownUntil = wait.until; // 旧表示との互換。適用先はquotaWaitsのscopeで判断する。
+  row.cooldownSource = 'quota';
+  row.lastQuota = wait;
   saveLimitState_(limits);
-  const reasons = { minute: '毎分の制限', daily: '1日の割当上限', unavailable: '利用枠が0。AI Studioのモデル利用枠を確認', unknown: '制限の種類を判別できないため日次更新まで待機' };
-  const error = waitError_('Gemini API HTTP 429（' + reasons[kind] + '）。次回: ' +
+  const reasons = { minute: '毎分の制限', daily: '1日の割当上限', unavailable: '利用枠が0。AI Studioのモデル利用枠を確認', unknown: unknownRetry ? '制限の種類を判別できないため短く待機して再確認' : '制限の種類を判別できないため日次更新まで待機' };
+  const error = waitError_('Gemini API HTTP 429 [' + config.geminiModel + ']（' + reasons[kind] + (scope === 'project' ? '・モデル共通の待機' : '') + '）。次回: ' +
     Utilities.formatDate(new Date(row.cooldownUntil), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') + ' 以降');
   error.retryAt = row.cooldownUntil;
   return error;
@@ -1648,6 +1704,40 @@ function diagnosePersonalYouTube() {
 
 /** 投稿間隔は各トリガーで1時間へ変更する。鍵・使用済み予算・投稿状態は維持する。 */
 /** 軽量モデルへの明示的な切替。APIの呼出し・キー表示・予算や待機の初期化はしない。 */
+/** BOT独自の日次上限を無効化する。旧版で混在していた待機だけを整理し、現モデルで再確認できるようにする。 */
+function configureGeminiUnlimited() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) throw new Error('他の処理が実行中です。終了後にconfigureGeminiUnlimitedを実行してください。');
+  try {
+    const config = getConfig_(true);
+    const limits = getLimitState_();
+    const row = limits.gemini;
+    const previous = row.lastQuota;
+    const legacy = row.cooldownUntil > Date.now() && row.cooldownSource === undefined &&
+      (!previous || previous.model !== config.geminiModel) && (!previous || previous.scope !== 'project');
+    if (legacy) {
+      const oldModel = previous && typeof previous.model === 'string' && /^[a-zA-Z0-9._-]{1,128}$/.test(previous.model) ? previous.model : null;
+      row.legacyCooldown = { until: row.cooldownUntil, oldModel: oldModel,
+        resumedModel: config.geminiModel, recoveredAt: Date.now() };
+      if (oldModel) {
+        row.quotaWaits = row.quotaWaits || {};
+        const key = 'model:' + oldModel;
+        row.quotaWaits[key] = { model: oldModel, scope: 'model',
+          kind: ['minute', 'daily', 'unavailable', 'unknown'].indexOf(previous.kind) === -1 ? 'unknown' : previous.kind,
+          at: Date.now(), until: Math.max(row.quotaWaits[key] && row.quotaWaits[key].until || 0, row.cooldownUntil) };
+      }
+      delete row.cooldownUntil;
+      saveLimitState_(limits);
+      console.log('旧版の待機記録を保存し、現在のモデルで再確認できるようにしました。');
+    }
+    PropertiesService.getScriptProperties().setProperty('GEMINI_DAILY_REQUEST_BUDGET', '0');
+    console.log('現在のモデル: ' + config.geminiModel + '。BOT独自の日次上限を無効にしました。APIは呼んでいません。Google側の待機・毎時の周期・投稿結果の保護は維持します。');
+    return { model: config.geminiModel, geminiDailyLimitDisabled: true, legacyWaitRecovered: legacy };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function configureLowTokenGemini() {
   PropertiesService.getScriptProperties().setProperty('GEMINI_MODEL', DEFAULT_GEMINI_MODEL);
   console.log('軽量モデル ' + DEFAULT_GEMINI_MODEL + ' を指定しました。思考量minimal・出力上限・使用済み予算・保存済みの待機を維持します。');
@@ -1656,9 +1746,12 @@ function configureLowTokenGemini() {
 function configureHourlyCommentary() {
   const properties = PropertiesService.getScriptProperties();
   properties.setProperty('ENABLE_FEELING_VARIATION', 'true');
-  properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '72');
+  const unlimited = String(properties.getProperty('GEMINI_DAILY_REQUEST_BUDGET') || '').trim() === '0';
+  if (!unlimited) properties.setProperty('GEMINI_DAILY_REQUEST_BUDGET', '72');
   properties.setProperty('YOUTUBE_MIN_INTERVAL_MINUTES', '60');
-  console.log('実況の変化を有効にしました。自動処理は通常毎時1回、失敗時は最大2回再試行、解析予算は72試行/日です。学校・個人それぞれのトリガーを1時間に設定してください。');
+  console.log('実況の変化を有効にしました。自動処理は通常毎時1回、失敗時は最大2回再試行。' +
+    (unlimited ? 'BOT独自の日次上限は無効のままです。' : '解析予算は72試行/日です。') +
+    '学校・個人それぞれのトリガーを1時間に設定してください。');
 }
 
 function normalizeFeeling_(text) {

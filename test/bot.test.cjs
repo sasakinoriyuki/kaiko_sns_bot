@@ -19,7 +19,7 @@ const geminiResponse = (text = 'ぼく、桑の葉をもぐもぐ、おなかい
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
-  let now = options.now ?? Date.now();
+  let now = options.now ?? Date.parse('2026-11-12T02:00:00Z');
   const calls = { retryDelays: [], triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     channelRequests: [], playlists: [], scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { ENABLE_REARING_CONTEXT: 'false', GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
@@ -3814,4 +3814,214 @@ test('棒や定規が見えていても一枚の写真で成長・実寸・倍�
     assert.ok(h.calls.console.some(line => line.includes('[scale_unverified_growth]')));
     assert.equal(h.calls.logs.length, 0);
   }
+});
+
+
+test('日次上限0なら72試行を超えても記録を維持し手動解析を続けられる', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_FEELING_VARIATION: 'false', GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: Array.from({ length: 80 }, () => careResponse()) });
+  for (let i = 0; i < 80; i++) {
+    if (i) h.advance(60000);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  }
+  assert.equal(h.calls.gemini.length, 80);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 80);
+});
+
+test('日次上限0でも連打の1分待機とGoogleの429は維持する', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }], '120s'), careResponse()] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  const saved = h.values.YOSAN_LIMITS_V1;
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.values.YOSAN_LIMITS_V1, saved);
+  assert.equal(h.calls.gemini.length, 1);
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('上限無効でも失敗時の自動再試行は同じ時間枠で3試行に止まる', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: [response(503, {}), response(503, {}), response(503, {})] });
+  h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  h.advance(180000); h.context.retrySchoolAnalysis({ triggerUid: 'retry1' });
+  h.advance(300000); h.context.retrySchoolAnalysis({ triggerUid: 'retry2' });
+  assert.equal(h.calls.gemini.length, 3);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('上限無効の使用量表示はInfinityにせず実際の試行数と1分間隔を示す', () => {
+  const h = preparedSchool({ properties: { GEMINI_DAILY_REQUEST_BUDGET: '0' } });
+  const report = h.context.showBotUsage();
+  assert.equal(report.geminiDailyBudget, 0);
+  assert.equal(report.geminiDailyLimitDisabled, true);
+  assert.equal(report.geminiMinMinutes, 1);
+  assert.ok(!JSON.stringify(report).includes('Infinity'));
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('Geminiだけ0を許可し他サービスの0や不正な日次予算は拒否する', () => {
+  for (const value of ['-1', '1.5', 'invalid']) {
+    const h = preparedSchool({ properties: { GEMINI_DAILY_REQUEST_BUDGET: value } });
+    assert.throws(() => h.context.getConfig_(true), /GEMINI_DAILY_REQUEST_BUDGET/);
+  }
+  assert.equal(preparedSchool({ properties: { GEMINI_DAILY_REQUEST_BUDGET: '0' } }).context.getConfig_(true).geminiDailyBudget, 0);
+  assert.throws(() => preparedSchool({ properties: { YOUTUBE_DAILY_UNIT_BUDGET: '0' } }).context.getConfig_(true), /YOUTUBE_DAILY_UNIT_BUDGET/);
+});
+
+test('モデルを切り替えたら旧モデルの確認済み割当待機を新モデルへ持ち越さない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.6-flash' },
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }], '30s'), careResponse()] });
+  h.context.analyzeLatestImageAndLog();
+  const until = JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.quotaWaits['model:gemini-3.6-flash'].until;
+  h.values.GEMINI_MODEL = 'gemini-3.5-flash-lite';
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.quotaWaits['model:gemini-3.6-flash'].until, until);
+  h.values.GEMINI_MODEL = 'gemini-3.6-flash';
+  h.advance(60000);
+  const waiting = h.context.analyzeLatestImageAndLog();
+  assert.equal(waiting.status, 'rate_limited');
+  assert.ok(waiting.reason.includes('gemini-3.6-flash'));
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('Googleのプロジェクト全体の割当待機はモデル変更や上限無効で解除しない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.6-flash' },
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerDayPerProject' }], '30s')] });
+  h.context.analyzeLatestImageAndLog();
+  h.values.GEMINI_MODEL = 'gemini-3.5-flash-lite';
+  const before = h.values.YOSAN_LIMITS_V1;
+  assert.equal(h.context.configureGeminiUnlimited().legacyWaitRecovered, false);
+  assert.equal(h.values.YOSAN_LIMITS_V1, before);
+  h.advance(60000);
+  const waiting = h.context.analyzeLatestImageAndLog();
+  assert.equal(waiting.status, 'rate_limited');
+  assert.ok(waiting.reason.includes('モデル共通'));
+  assert.ok(waiting.reason.includes('gemini-3.5-flash-lite'));
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('16時25分の旧版のモデル不明待機を保存して現モデルで再確認できる', () => {
+  const old = { gemini: { day: '2026-11-11', count: 20, lastAttempt: Date.parse('2026-11-12T06:41:00Z'),
+    cooldownUntil: Date.parse('2026-11-12T08:01:00Z') }, youtube: { nameSequence: 12, coinFreePosts: 3 }, x: { count: 1 } };
+  const h = preparedSchool({ now: Date.parse('2026-11-12T07:25:13Z'),
+    properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.5-flash-lite', YOSAN_LIMITS_V1: JSON.stringify(old) },
+    geminiResponses: [careResponse()] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  const result = h.context.configureGeminiUnlimited();
+  assert.equal(result.legacyWaitRecovered, true);
+  assert.equal(result.model, 'gemini-3.5-flash-lite');
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  const saved = JSON.parse(h.values.YOSAN_LIMITS_V1);
+  assert.equal(saved.gemini.count, 20);
+  assert.equal(saved.gemini.legacyCooldown.until, old.gemini.cooldownUntil);
+  assert.deepEqual(saved.youtube, old.youtube);
+  assert.deepEqual(saved.x, old.x);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 21);
+});
+
+test('旧形式の3.6の待機を移行しても戻したときの待機は残す', () => {
+  const until = Date.parse('2026-11-12T08:01:00Z');
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.5-flash-lite',
+    YOSAN_LIMITS_V1: JSON.stringify({ gemini: { count: 20, day: '2026-11-11', cooldownUntil: until,
+      lastQuota: { kind: 'daily', model: 'gemini-3.6-flash', until, at: Date.parse('2026-11-12T01:00:00Z') } } }) } });
+  assert.equal(h.context.configureGeminiUnlimited().legacyWaitRecovered, true);
+  h.values.GEMINI_MODEL = 'gemini-3.6-flash';
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('現在のモデルの確認済み待機や新形式の503待機は回復関数で解除しない', () => {
+  for (const reply of [quotaResponse([{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }], '30s'), response(503, {}, { 'Retry-After': '3600' })]) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [reply] });
+    try { h.context.analyzeLatestImageAndLog(); } catch (error) { assert.ok(error.message.includes('HTTP 503')); }
+    const before = h.values.YOSAN_LIMITS_V1;
+    assert.equal(h.context.configureGeminiUnlimited().legacyWaitRecovered, false);
+    assert.equal(h.values.YOSAN_LIMITS_V1, before);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('他モデルの長い待機があっても503の共通待機を翌日まで延ばさない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.6-flash' },
+    geminiResponses: [quotaResponse([{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }], '30s'), response(503, {}), careResponse()] });
+  h.context.analyzeLatestImageAndLog();
+  h.values.GEMINI_MODEL = 'gemini-3.5-flash-lite'; h.advance(60000);
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), /HTTP 503/);
+  assert.ok(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.cooldownUntil <= h.now() + 180000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  h.advance(180000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  h.values.GEMINI_MODEL = 'gemini-3.6-flash'; h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 3);
+});
+
+test('壊れたモデル別待機を黙って初期化せずAPI前に停止する', () => {
+  for (const quotaWaits of [[], { invalid: {} }, { 'model:gemini-3.5-flash-lite': { until: -1 } }]) {
+    const h = preparedSchool({ properties: { YOSAN_LIMITS_V1: JSON.stringify({ gemini: { quotaWaits } }) } });
+    const before = h.values.YOSAN_LIMITS_V1;
+    assert.throws(() => h.context.configureGeminiUnlimited(), /Gemini待機/);
+    assert.equal(h.values.YOSAN_LIMITS_V1, before);
+    assert.equal(h.calls.gemini.length, 0);
+  }
+});
+
+test('上限無効でも投稿結果不明と名前・比較物の間隔を変更しない', () => {
+  const state = '{"youtube":"unknown","feeling":"ぼく、ここが好きだな。","logged":true}';
+  const limits = '{"gemini":{"count":72},"youtube":{"nameSequence":9,"coinFreePosts":2,"lastPost":12345}}';
+  const h = preparedSchool({ properties: { YOSAN_STATE_V1: state, YOSAN_LIMITS_V1: limits } });
+  h.context.configureGeminiUnlimited();
+  assert.equal(h.values.YOSAN_STATE_V1, state);
+  assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+  h.values.GEMINI_DAILY_REQUEST_BUDGET = ' 0 ';
+  h.context.configureHourlyCommentary();
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, ' 0 ');
+});
+
+test('回復設定がロック競合中なら設定や記録を変更せず後の実行を案内する', () => {
+  const h = preparedSchool({ busy: true });
+  const before = JSON.stringify(h.values);
+  assert.throws(() => h.context.configureGeminiUnlimited(), /他の処理/);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+
+test('範囲が共通と記録された旧待機はsourceがなくても回復関数で外さない', () => {
+  const until = Date.parse('2026-11-12T08:01:00Z');
+  const limits = JSON.stringify({ gemini: { count: 20, cooldownUntil: until,
+    lastQuota: { kind: 'daily', scope: 'project', model: 'gemini-3.6-flash', until, at: Date.parse('2026-11-12T01:00:00Z') } } });
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_MODEL: 'gemini-3.5-flash-lite', YOSAN_LIMITS_V1: limits } });
+  assert.equal(h.context.configureGeminiUnlimited().legacyWaitRecovered, false);
+  assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'rate_limited');
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('上限0では種類不明429を翌日までと推測せずAPIの待機指示で最大3試行する', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: [quotaResponse([{ quotaId: 'UnknownLimit' }], '240s'),
+      quotaResponse([{ quotaId: 'UnknownLimit' }], '180s'), response(429, {})] });
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'hourly' });
+  assert.equal(first.retryScheduled, true);
+  assert.equal(first.retryAt, h.now() + 240000);
+  assert.ok(first.reason.includes('短く待機して再確認'));
+  assert.ok(!first.reason.includes('日次更新'));
+  h.advance(240000); h.context.retrySchoolAnalysis({ triggerUid: 'retry1' });
+  h.advance(300000); h.context.retrySchoolAnalysis({ triggerUid: 'retry2' });
+  assert.equal(h.calls.gemini.length, 3);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
 });
