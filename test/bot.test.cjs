@@ -4025,3 +4025,193 @@ test('上限0では種類不明429を翌日までと推測せずAPIの待機指�
   assert.equal(h.calls.gemini.length, 3);
   assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
 });
+
+
+const DREAM_FEELING = 'わたしは静かなこの場所で、どんな夢をみようかな。';
+
+test('報告された夢の自問は1回の画像解析で準備し日時と名前付きで投稿できる', () => {
+  const school = preparedSchool({ now: Date.parse('2026-11-12T08:01:09Z'),
+    properties: { ...CARE_PROPERTIES, ...NAMED_PROPERTIES }, geminiResponses: [careResponse(DREAM_FEELING, {
+      stageText: '蚕3齢（10日目）', temperatureText: '23.9 ℃', humidityText: '61.6 %',
+      cleaningStatusText: '掃除中・・・・', scaleReferenceText: null
+    })] });
+  assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(school.state().feeling, DREAM_FEELING);
+  assert.equal(school.calls.gemini.length, 1);
+  const h = personalWithPrepared(school, { now: school.now() });
+  assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText, '2026/11/12 17:01\nこはく：' + DREAM_FEELING);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('本人の自然な自問や意向を感情語の単語だけに限定せず採用する', () => {
+  const h = preparedSchool();
+  for (const feeling of [DREAM_FEELING, 'ぼく、この葉のそばで一息つこうかな。',
+    'わたし、ここで休もうかしら。', 'ぼく、もう少しここにいようかな。', 'ぼく、この場所で丸まろうかな。']) {
+    h.context.validateSilkwormVoice_(feeling);
+  }
+  assert.equal(h.context.normalizeSilkwormFeeling_('ここで少し休もうかな。'), 'ぼく、ここで少し休もうかな。');
+  assert.throws(() => h.context.normalizeSilkwormFeeling_('仲間はここで休もうかな。'), e => e.voiceReason === 'ambiguous_subject');
+});
+
+test('かなという語尾だけの数値の読み上げや観察者文を心の声として通さない', () => {
+  const h = preparedSchool();
+  for (const feeling of ['わたし、温度は何度かな。', 'ぼく、湿度61.6%かな。',
+    'わたし、ここにいます。', 'ぼくは写真からどんな夢をみようかな。', 'ぼく、蚕たちは休もうかなと言っています。']) {
+    assert.throws(() => h.context.validateSilkwormVoice_(feeling), e => e.botStatus === 'voice_mismatch');
+  }
+});
+
+test('自然な意向を認めても棒の寝床や一人の設定を通さない', () => {
+  for (const feeling of ['棒を枕にしてぼくは休もうかな。', 'わたし、一人でどんな夢をみようかな。']) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling, ROD_UI)] });
+    setCoinGap(h, 4);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+    assert.equal(h.calls.logs.length, 0);
+    assert.equal(h.calls.chats.length, 0);
+  }
+});
+
+test('飼育目安で見送った自動解析も別実行で再確認し診断に理由と予定を残す', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('ぼく、暑くて休みたいな。'), careResponse(DREAM_FEELING)] });
+  const result = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(result.status, 'care_mismatch');
+  assert.equal(result.retryScheduled, true);
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.recentIssues.school[0].code, 'care_mismatch');
+  assert.equal(report.retry.school.pending, true);
+  assert.equal(report.retry.school.attempts, 1);
+  assert.equal(h.calls.gemini.length, 1);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  const ready = h.context.diagnoseBotStatus();
+  assert.equal(ready.prepared.voiceIssue, null);
+  assert.equal(ready.retry.school, null);
+});
+
+test('BOT状態診断は学校側でAPIと記録を書き換えずキー・本文・保存先を出さない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0',
+    FOLDER_ID: 'private-folder', SPREADSHEET_ID: 'private-sheet' }, geminiResponses: [careResponse(DREAM_FEELING)] });
+  h.context.analyzeLatestImageAndLog();
+  const before = JSON.stringify(h.values), printed = h.calls.console.length;
+  delete h.context.UrlFetchApp; delete h.context.SpreadsheetApp; delete h.context.DriveApp;
+  const properties = h.context.PropertiesService.getScriptProperties(), original = properties.getProperty;
+  properties.getProperties = () => { throw new Error('全プロパティを読まない'); };
+  properties.getProperty = (key) => { if (key === 'GEMINI_API_KEY') throw new Error('キーを読まない'); return original(key); };
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.status, 'diagnosed');
+  assert.equal(report.prepared.voiceIssue, null);
+  assert.equal(report.prepared.logged, true);
+  assert.equal(report.prepared.currentAnalysisFormat, true);
+  assert.equal(report.config.geminiDailyBudget, 0);
+  assert.equal(JSON.stringify(h.values), before);
+  const text = h.calls.console.slice(printed).join(' ');
+  for (const privateValue of ['test-gemini-key', 'private-folder', 'private-sheet', DREAM_FEELING]) assert.ok(!text.includes(privateValue));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('個人側もBOT状態診断だけならDrive・Sheets・GeminiキーやYouTube接続を使わない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { triggers: ['postPreparedCommentToYouTube', 'privateHandler'] });
+  delete h.context.YouTube;
+  const before = JSON.stringify(h.values);
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.status, 'diagnosed');
+  assert.deepEqual(report.ownTriggers, ['postPreparedCommentToYouTube']);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('診断は壊れた状態や設定でも残りを表示し生の値を漏らさず初期化しない', () => {
+  const h = preparedSchool({ properties: {
+    GEMINI_MODEL: 'AIza-private-model-value', DRY_RUN: 'private-flag', GEMINI_DAILY_REQUEST_BUDGET: 'private-budget',
+    YOSAN_STATE_V1: '{private-invalid', YOSAN_LIMITS_V1: '{private-invalid',
+    YOSAN_RETRY_V1_school: '{private-invalid', YOSAN_ISSUES_V1_school: '{private-invalid',
+    YOSAN_YOUTUBE_LAST_ERROR_V1: '{"code":"private-value","stage":"private-stage","detail":"private-detail"}'
+  } });
+  h.context.ScriptApp.getProjectTriggers = () => { throw new Error('private-trigger-error'); };
+  const before = JSON.stringify(h.values);
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.config.model, 'invalid');
+  assert.equal(report.config.dryRun, 'invalid');
+  assert.equal(report.config.geminiDailyBudget, 'invalid');
+  assert.equal(report.prepared.invalid, true);
+  assert.equal(report.gemini.invalid, true);
+  assert.equal(report.retry.school.invalid, true);
+  assert.equal(report.recentIssues.school.invalid, true);
+  assert.equal(report.ownTriggers, 'unavailable');
+  assert.equal(JSON.stringify(h.values), before);
+  assert.ok(!h.calls.console.join(' ').includes('private'));
+});
+
+test('解析の見送り履歴は直近10件だけ残し候補文や認証情報は保存しない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: Array.from({ length: 12 }, () => careResponse('わたし、ここにいます。')) });
+  const first = h.now();
+  for (let i = 0; i < 12; i++) {
+    if (i) h.advance(60000);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  }
+  const saved = JSON.parse(h.values.YOSAN_ISSUES_V1_school);
+  assert.equal(saved.items.length, 10);
+  assert.equal(saved.items[0].at, first + 120000);
+  assert.ok(saved.items.every(item => item.code === 'missing_feeling'));
+  assert.ok(!h.values.YOSAN_ISSUES_V1_school.includes('わたし'));
+  assert.ok(!h.values.YOSAN_ISSUES_V1_school.includes('test-gemini-key'));
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.gemini.length, 12);
+});
+
+test('診断はGeminiのHTTPエラーのコードと現在の待機をAPI追加なしで示す', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [response(503, { error: 'private-body' })] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), /HTTP 503/);
+  const before = JSON.stringify(h.values);
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.recentIssues.school[0].code, 'GEMINI_HTTP_503');
+  assert.equal(report.gemini.waiting, true);
+  assert.ok(report.gemini.waitReason.includes('gemini-3.5-flash-lite'));
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.ok(!h.calls.console.join(' ').includes('private-body'));
+});
+
+test('YouTubeの失敗も履歴に残すが診断でunknownを解除したり再送したりしない', () => {
+  const school = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  school.context.analyzeLatestImageAndLog();
+  const h = personalWithPrepared(school, { chatFailure: new Error('network private-token') });
+  h.context.postPreparedCommentToYouTube();
+  assert.equal(h.state().youtube, 'unknown');
+  const before = JSON.stringify(h.values);
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.prepared.youtube, 'unknown');
+  assert.equal(report.recentIssues.youtube.length, 1);
+  assert.equal(report.recentIssues.youtube[0].status, 'error');
+  assert.equal(h.calls.chats.length, 1);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.ok(!h.values.YOSAN_ISSUES_V1_youtube.includes('private-token'));
+});
+
+test('診断用の履歴を保存できなくても投稿の制御を壊さず次の解析で復帰できる', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES,
+    failPropertyWrite: (key) => key.startsWith('YOSAN_ISSUES_V1_'),
+    geminiResponses: [careResponse('わたし、ここにいます。'), careResponse(DREAM_FEELING)] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'voice_mismatch');
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('診断のロック競合時は状態を変更せず後の実行を案内する', () => {
+  const h = preparedSchool({ busy: true });
+  const before = JSON.stringify(h.values);
+  assert.equal(h.context.diagnoseBotStatus().status, 'busy');
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+});

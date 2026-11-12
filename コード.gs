@@ -8,6 +8,7 @@ const BOT_HANDLER = 'processLatestImageAndLog';
 const BOT_LIMITS_KEY = 'YOSAN_LIMITS_V1';
 const BOT_PREVIEW_KEY = 'YOSAN_PREVIEW_V1';
 const BOT_YOUTUBE_ERROR_KEY = 'YOSAN_YOUTUBE_LAST_ERROR_V1';
+const BOT_ISSUE_PREFIX = 'YOSAN_ISSUES_V1_';
 const BOT_FEELING_HISTORY_KEY = 'YOSAN_FEELING_HISTORY_V1';
 const FEELING_HISTORY_SIZE = 8;
 const COIN_TOPIC_GAP = 4; // 硬貨・棒・定規など比較用の物に共通の間隔。保存済みカウンター名は互換性のため維持。
@@ -238,6 +239,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
     console.log('処理結果: YouTube=' + state.youtube + ', X=' + (config.enableX ? state.x : 'disabled') + ', Instagram=' + (config.enableInstagram ? state.instagram : 'disabled'));
     return { status: 'processed', youtube: state.youtube, x: config.enableX ? state.x : 'disabled', instagram: config.enableInstagram ? state.instagram : 'disabled' };
   } catch (error) {
+    rememberBotIssue_('school', error);
     if (error.botWait) {
       console.log(error.message);
       return { status: error.botStatus || 'rate_limited', reason: error.message, retryAt: error.retryAt };
@@ -1255,7 +1257,7 @@ function runScheduledRole_(role, event, isRetry) {
   if (!current || current.id !== window.id || current.attempts !== window.attempts) return result;
   const retryable = result.retryable || result.status === 'busy' ||
     result.status === 'rate_limited' && Number.isFinite(result.retryAt) ||
-    role === 'school' && ['voice_mismatch', 'grounding_mismatch', 'duplicate_comment'].indexOf(result.status) !== -1 ||
+    role === 'school' && ['voice_mismatch', 'grounding_mismatch', 'care_mismatch', 'duplicate_comment'].indexOf(result.status) !== -1 ||
     role === 'youtube' && ['waiting_analysis', 'waiting_fresh_analysis', 'no_live'].indexOf(result.status) !== -1;
   if (!retryable || window.attempts >= SCHEDULED_MAX_ATTEMPTS) {
     properties.deleteProperty(key);
@@ -1584,6 +1586,7 @@ function postPreparedCommentToYouTube_(event) {
     });
     return { status: 'processed', youtube: state.youtube };
   } catch (error) {
+    rememberBotIssue_('youtube', error);
     const diagnostic = rememberYouTubeDiagnostic_(error, stage);
     console.error('個人側YouTube処理 [' + diagnostic.stage + ' / ' + diagnostic.code + ']: ' + diagnostic.detail);
     return { status: error.botWait ? error.botStatus || 'rate_limited' : 'error', stage: stage, code: diagnostic.code,
@@ -1655,6 +1658,130 @@ function rememberYouTubeDiagnostic_(error, stage) {
   return diagnostic;
 }
 
+/** 実際の処理中の見送り・エラーを、本文や認証情報を含めず各担当の直近10件だけ保存する。 */
+function rememberBotIssue_(role, error) {
+  if (['school', 'youtube'].indexOf(role) === -1) return;
+  try {
+    error = error && typeof error === 'object' ? error : {};
+    let code = 'EXECUTION_ERROR';
+    let status = 'error';
+    if (['empty_body', 'observer_language', 'missing_feeling', 'missing_first_person', 'ambiguous_subject', 'prefix_too_long'].indexOf(error.voiceReason) !== -1) {
+      code = error.voiceReason; status = 'voice_mismatch';
+    } else if (['unsupported_story', 'cleaning_not_confirmed', 'repeated_cleaning', 'coin_not_visible', 'coin_not_size_reference',
+        'coin_unverified_growth', 'repeated_coin_post', 'repeated_coin_generation', 'scale_not_visible', 'scale_not_size_reference',
+        'scale_unverified_growth'].indexOf(error.groundingReason) !== -1) {
+      code = error.groundingReason; status = 'grounding_mismatch';
+    } else if (['care_mismatch', 'duplicate_comment'].indexOf(error.botStatus) !== -1) {
+      code = error.botStatus; status = error.botStatus;
+    } else if (role === 'youtube') {
+      code = youtubeDiagnostic_(error, '').code;
+      status = error.botWait ? 'rate_limited' : 'error';
+    } else {
+      const http = String(error.message || '').match(/Gemini API HTTP ([1-5][0-9]{2})/);
+      code = http ? 'GEMINI_HTTP_' + http[1] : error.botWait ? 'WAIT' : error.botRetryable ? 'GEMINI_CONNECTION_OR_SERVICE' : 'EXECUTION_ERROR';
+      status = error.botWait ? 'rate_limited' : http || error.botRetryable ? 'api_error' : 'error';
+    }
+    const properties = PropertiesService.getScriptProperties();
+    const key = BOT_ISSUE_PREFIX + role;
+    const saved = readJsonProperty_(properties, key);
+    if (saved !== null && (!saved || !Array.isArray(saved.items))) return;
+    const items = (saved && saved.items || []).slice(-9);
+    items.push({ at: Date.now(), status: status, code: code });
+    properties.setProperty(key, JSON.stringify({ items: items }));
+  } catch (ignored) {
+    console.log('診断用の履歴を保存できませんでした。通常の投稿保護は維持します。');
+  }
+}
+
+/** Gemini・YouTubeへ接続せず、設定値の一部と保存状態だけを確認する。状態は書き換えない。 */
+function diagnoseBotStatus() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    console.log('BOT診断: 他の処理が実行中です。終了後にdiagnoseBotStatusを実行してください。');
+    return { status: 'busy' };
+  }
+  try {
+    const properties = PropertiesService.getScriptProperties();
+    const read = function (key) {
+      try { return { value: readJsonProperty_(properties, key), invalid: false }; }
+      catch (ignored) { return { value: null, invalid: true }; }
+    };
+    const time = function (value) {
+      return Number.isSafeInteger(value) && value >= 0 && Number.isFinite(new Date(value).getTime())
+        ? Utilities.formatDate(new Date(value), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm:ss') : null;
+    };
+    const flag = function (key, fallback) {
+      const value = properties.getProperty(key);
+      return value === null ? fallback : value === 'true' ? true : value === 'false' ? false : 'invalid';
+    };
+    const value = String(properties.getProperty('GEMINI_MODEL') || DEFAULT_GEMINI_MODEL).trim();
+    const model = /^gemini-[a-zA-Z0-9._-]{1,100}$/.test(value) ? value : 'invalid';
+    const report = { status: 'diagnosed', checkedAt: time(Date.now()),
+      config: { model: model, dryRun: flag('DRY_RUN', true), splitAccounts: flag('SPLIT_ACCOUNT_MODE', false),
+        varyFeelings: flag('ENABLE_FEELING_VARIATION', false), rearingContext: flag('ENABLE_REARING_CONTEXT', true) } };
+    try {
+      report.config.geminiDailyBudget = integerBudgetProperty_({
+        GEMINI_DAILY_REQUEST_BUDGET: properties.getProperty('GEMINI_DAILY_REQUEST_BUDGET')
+      }, 'GEMINI_DAILY_REQUEST_BUDGET', 48, true);
+    } catch (ignored) { report.config.geminiDailyBudget = 'invalid'; }
+    const stateRead = read(BOT_STATE_KEY);
+    const state = stateRead.value;
+    const expected = report.config.rearingContext === false ? LEGACY_ANALYSIS_VERSION : REARING_ANALYSIS_VERSION;
+    report.prepared = { invalid: stateRead.invalid || Boolean(state && (Array.isArray(state) || typeof state !== 'object')),
+      logged: Boolean(state && state.logged === true), currentAnalysisFormat: Boolean(state && state.analysisVersion === expected),
+      generatedAt: time(state && state.generatedAt),
+      youtube: state && ['pending', 'sent', 'unknown', 'sending'].indexOf(state.youtube) !== -1 ? state.youtube : 'not_prepared',
+      voiceIssue: state && typeof state.feeling === 'string' ? silkwormVoiceIssue_(state.feeling) : 'not_prepared' };
+    try {
+      const limits = getLimitState_();
+      report.gemini = { dailyCount: limits.gemini.day === quotaDay_() ? limits.gemini.count || 0 : 0,
+        lastAttemptAt: time(limits.gemini.lastAttempt), waiting: false };
+      report.gemini.dailyLimitReached = typeof report.config.geminiDailyBudget === 'number' && report.config.geminiDailyBudget > 0 &&
+        report.gemini.dailyCount >= report.config.geminiDailyBudget;
+      report.youtubeUsage = { count: limits.youtube.count || 0, lastPostAttemptAt: time(limits.youtube.lastPost) };
+      if (model !== 'invalid') {
+        try { checkGeminiCooldown_(limits.gemini, model); }
+        catch (error) {
+          if (error.botWait) { report.gemini.waiting = true; report.gemini.retryAt = time(error.retryAt); report.gemini.waitReason = error.message; }
+          else report.gemini.invalid = true;
+        }
+      }
+    } catch (ignored) { report.gemini = { invalid: true }; }
+    report.retry = {};
+    report.recentIssues = {};
+    ['school', 'youtube'].forEach(function (role) {
+      try {
+        const retry = readScheduledRetry_(properties, role);
+        report.retry[role] = retry ? { pending: retry.pending, attempts: retry.attempts, nextAt: time(retry.nextAt), expiresAt: time(retry.expiresAt) } : null;
+      } catch (ignored) { report.retry[role] = { invalid: true }; }
+      const issues = read(BOT_ISSUE_PREFIX + role);
+      const statuses = ['voice_mismatch', 'grounding_mismatch', 'care_mismatch', 'duplicate_comment', 'rate_limited', 'api_error', 'error'];
+      const allowedCodes = ['empty_body', 'observer_language', 'missing_feeling', 'missing_first_person', 'ambiguous_subject', 'prefix_too_long',
+        'unsupported_story', 'cleaning_not_confirmed', 'repeated_cleaning', 'coin_not_visible', 'coin_not_size_reference', 'coin_unverified_growth',
+        'repeated_coin_post', 'repeated_coin_generation', 'scale_not_visible', 'scale_not_size_reference', 'scale_unverified_growth',
+        'care_mismatch', 'duplicate_comment', 'WAIT', 'EXECUTION_ERROR', 'GEMINI_CONNECTION_OR_SERVICE'];
+      report.recentIssues[role] = issues.value && Array.isArray(issues.value.items) ? issues.value.items.slice(-10).map(function (item) {
+        const code = item && typeof item.code === 'string' ? item.code : '';
+        const youtube = role === 'youtube' ? youtubeDiagnostic_({ message: code }, '').code : 'UNCLASSIFIED';
+        return { at: time(item && item.at), status: item && statuses.indexOf(item.status) !== -1 ? item.status : 'invalid',
+          code: allowedCodes.indexOf(code) !== -1 || /^GEMINI_HTTP_[1-5][0-9]{2}$/.test(code) ? code : youtube };
+      }) : issues.invalid || issues.value ? { invalid: true } : [];
+    });
+    const previous = read(BOT_YOUTUBE_ERROR_KEY);
+    report.lastYouTubeError = previous.value ? { at: time(previous.value.at),
+      code: youtubeDiagnostic_({ message: previous.value.code || '' }, '').code } : previous.invalid ? { invalid: true } : null;
+    try {
+      const handlers = [BOT_HANDLER, 'analyzeLatestImageAndLog', 'postPreparedCommentToYouTube', 'retrySchoolAnalysis', 'retryPersonalYouTube'];
+      report.ownTriggers = ScriptApp.getProjectTriggers().map(function (trigger) { return trigger.getHandlerFunction(); })
+        .filter(function (handler) { return handlers.indexOf(handler) !== -1; });
+    } catch (ignored) { report.ownTriggers = 'unavailable'; }
+    console.log('BOT診断（投稿・Gemini/YouTube呼出しなし）: ' + JSON.stringify(report));
+    return report;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /** 個人側の読み取り専用診断。投稿・投稿状態のリセットは行わない。 */
 function diagnosePersonalYouTube() {
   requireBotScopes_('youtube', false);
@@ -1702,8 +1829,6 @@ function diagnosePersonalYouTube() {
 }
 
 
-/** 投稿間隔は各トリガーで1時間へ変更する。鍵・使用済み予算・投稿状態は維持する。 */
-/** 軽量モデルへの明示的な切替。APIの呼出し・キー表示・予算や待機の初期化はしない。 */
 /** BOT独自の日次上限を無効化する。旧版で混在していた待機だけを整理し、現モデルで再確認できるようにする。 */
 function configureGeminiUnlimited() {
   const lock = LockService.getScriptLock();
@@ -1738,11 +1863,13 @@ function configureGeminiUnlimited() {
   }
 }
 
+/** 軽量モデルへの明示的な切替。APIの呼出し・キー表示・予算や待機の初期化はしない。 */
 function configureLowTokenGemini() {
   PropertiesService.getScriptProperties().setProperty('GEMINI_MODEL', DEFAULT_GEMINI_MODEL);
   console.log('軽量モデル ' + DEFAULT_GEMINI_MODEL + ' を指定しました。思考量minimal・出力上限・使用済み予算・保存済みの待機を維持します。');
 }
 
+/** 投稿間隔は各トリガーで1時間へ変更する。鍵・使用済み予算・投稿状態は維持する。 */
 function configureHourlyCommentary() {
   const properties = PropertiesService.getScriptProperties();
   properties.setProperty('ENABLE_FEELING_VARIATION', 'true');
@@ -2184,6 +2311,7 @@ function silkwormVoicePrompt_() {
     '一人称を毎回冒頭に固定せず、語順も変える。「みんな」「仲間」は飼育場所に写る仲間の蚕を指し、視聴者の呼び名にしない。' +
     '本人の胸の中だけで完結する独白にする。視聴者への呼びかけ・閲覧確認・配信のお礼を書かない。' +
     '本人の好み、願望、安心、楽しみ、心配、のんびりした気分など、感情や心の声を一つ必ず含める。' +
+    '「わたしはどんな夢をみようかな。」「ぼく、ここで一息つこうかな。」のような自分への問いかけや小さな意向も心の声にできる。' +
     '「蚕たちが食べています」「元気そうですね」「写真から見ると」のような観察者・解説者の文を書かない。' +
     '「ぼく」を足しただけの観察報告や、温湿度・令・日数だけの読み上げも不可。' +
     '画像・画面・カメラ・AI・解析・観察者に言及せず、挨拶や名前の自己紹介も不要。' +
@@ -2195,7 +2323,7 @@ function silkwormVoiceMismatch_(reason, feeling) {
   const descriptions = {
     empty_body: '本文が空',
     observer_language: '観察者・解説者の表現',
-    missing_feeling: '気持ち・願望・感覚の表現がない',
+    missing_feeling: '気持ち・願望の表現を検査で確認できない',
     missing_first_person: '一人称がない',
     ambiguous_subject: '他者への言及があり一人称を補えない',
     prefix_too_long: '一人称を補うと70文字を超える'
@@ -2203,8 +2331,9 @@ function silkwormVoiceMismatch_(reason, feeling) {
   reason = reason || 'unknown';
   const candidate = typeof feeling === 'string' ? shortenText_(feeling.replace(/\s+/g, ' '), MAX_FEELING_CHARS) : '';
   console.log('一人称チェック不採用 [' + reason + ']: ' + JSON.stringify(candidate));
-  const error = waitError_('蚕本人の一人称の気持ちになっていないため、投稿せず次の解析を待ちます。理由: ' +
-    (descriptions[reason] || '形式を確認'));
+  const message = reason === 'missing_feeling' ? '蚕本人の気持ち・願望を検査で確認できないため、投稿せず次の解析を待ちます。理由: ' :
+    '蚕本人の一人称の気持ちになっていないため、投稿せず次の解析を待ちます。理由: ';
+  const error = waitError_(message + (descriptions[reason] || '形式を確認'));
   error.botStatus = 'voice_mismatch';
   error.voiceReason = reason;
   return error;
@@ -2217,7 +2346,8 @@ function silkwormVoiceIssue_(feeling) {
   const observer = /(?:蚕|カイコ|かいこ)(?:たち|達|さん|ちゃん|は|が|を|の様子|の気持ち)|お蚕|画像|写真|画面|映像|カメラ|実況|解説|解析|観察|見守|見え|見られ|見受け|元気そう|楽しそう|嬉しそう|うれしそう|眠そう|ねむそう|幸せそう|ように見|と言って|と話して|(?:飼育者|飼育員|視聴者)として|\bAI\b|人工知能|アシスタント/i;
   const feelingWords = /気分|気持ち|たい|ほしい|欲しい|うれし|嬉し|楽し|たのし|待ち遠し|待ちどおし|好き|すき|落ち着|ほっと|安心|心配|不安|のんびり|ゆっくり|ひと休み|一休み|わくわく|ワクワク|どきどき|ドキドキ|おいし|美味|幸せ|しあわせ|眠い|ねむ|満足|まんぞく|まったり|そわそわ|ソワソワ|むずむず|ムズムズ|うとうと|ウトウト|うきうき|ウキウキ|のびのび|気楽|心地|居心地|リラックス|最高|がんば|頑張|やる気|元気|くつろ|ほっこり|特等席|お気に入り|いいな|気になる|気になっ|気に入|いこう|しておこう|どうしよう|よかった|つら|辛|苦し|暑い|暑く|寒い|寒く|冷え|熱い|眩し|まぶしい|だる|疲れ|つかれ|お(?:腹|なか)(?:が)?(?:すい|空)|おなかいっぱい|お腹いっぱい/;
   if (observer.test(text)) return 'observer_language';
-  if (!feelingWords.test(text)) return 'missing_feeling';
+  const subjectiveChoice = /(?:夢(?:を)?(?:見|み)よう|(?:ひと息|一息)(?:を)?つこう|休もう|眠ろう|寝よう|くつろごう|過ごそう|丸まろう|まるまろう|伸ばそう|のばそう|いよう)(?:かな(?:あ|ぁ)?|かしら)[。！？!?]*$/;
+  if (!feelingWords.test(text) && !subjectiveChoice.test(text.trim())) return 'missing_feeling';
   if (!firstPerson.test(text)) return 'missing_first_person';
   return null;
 }
