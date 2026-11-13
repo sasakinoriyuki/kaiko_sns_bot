@@ -20,7 +20,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
   let now = options.now ?? Date.parse('2026-11-12T02:00:00Z');
-  const calls = { retryDelays: [], triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
+  const calls = { sheetOpens: [], headerWrites: 0, propertyBatches: [], retryDelays: [], triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     channelRequests: [], playlists: [], scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { ENABLE_REARING_CONTEXT: 'false', GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
@@ -33,6 +33,13 @@ function harness(options = {}) {
     setProperty(name, value) {
       if (options.failPropertyWrite?.(name, value)) throw new Error('property storage failure');
       values[name] = value;
+      return this;
+    },
+    setProperties(updates, deleteAllOthers) {
+      if (Object.entries(updates).some(([name, value]) => options.failPropertyWrite?.(name, value))) throw new Error('property storage failure');
+      calls.propertyBatches.push({ updates: clone(updates), deleteAllOthers });
+      if (deleteAllOthers) Object.keys(values).forEach(name => delete values[name]);
+      Object.assign(values, updates);
       return this;
     },
     deleteProperty: (name) => { delete values[name]; }
@@ -85,6 +92,8 @@ function harness(options = {}) {
         getValues: () => Array.from({ length: height }, (_, i) =>
           Array.from({ length: width }, (_, j) => data[row - 1 + i]?.[column - 1 + j] ?? '')),
         setValues(rows) {
+          if (options.sheetWriteError) throw options.sheetWriteError;
+          if (row === 1) calls.headerWrites++;
           if (row === 2 && remainingLogFailures-- > 0) throw new Error('sheet write failure');
           rows.forEach((cells, i) => {
             data[row - 1 + i] ||= [];
@@ -171,7 +180,12 @@ function harness(options = {}) {
       return next;
     } },
     SpreadsheetApp: {
-      openById: () => spreadsheet,
+      openById: (id) => {
+        calls.sheetOpens.push(id);
+        const error = typeof options.spreadsheetOpenError === 'function' ? options.spreadsheetOpenError(id) : options.spreadsheetOpenError;
+        if (error) throw error;
+        return spreadsheet;
+      },
       flush: () => { calls.flushes++; if (remainingFlushFailures-- > 0) throw new Error('flush interrupted'); }
     },
     YouTube: {
@@ -4214,4 +4228,290 @@ test('診断のロック競合時は状態を変更せず後の実行を案内�
   assert.equal(JSON.stringify(h.values), before);
   assert.equal(h.calls.gemini.length, 0);
   assert.equal(h.calls.chats.length, 0);
+});
+
+const RECOVERY_SHEET = '1fEgkHcYNTiRN3KeFKu39wAe2R87QZmqt8cFjXebpPaU';
+const LOG_HEADERS = ['日時', '画像ファイル名', '蚕の気持ち', '処理ID'];
+
+test('復旧先の編集確認後に保存先だけ切り替え、元の設定を控える', () => {
+  const h = preparedSchool({ sheetData: [LOG_HEADERS], properties: {
+    SPREADSHEET_ID: 'old-private-sheet', LOG_SHEET_NAME: 'old-log',
+    GEMINI_DAILY_REQUEST_BUDGET: '0', YOSAN_STATE_V1: '{"youtube":"unknown"}',
+    YOSAN_LIMITS_V1: '{"private":"preserved"}', YOSAN_FEELING_HISTORY_V1: '{"texts":["before"]}'
+  } });
+  const before = { ...h.values };
+  assert.equal(h.context.configureLogSpreadsheet().status, 'configured');
+  assert.deepEqual(h.calls.sheetOpens, [RECOVERY_SHEET]);
+  assert.equal(h.calls.headerWrites, 1);
+  assert.equal(h.calls.flushes, 1);
+  assert.equal(h.values.SPREADSHEET_ID, RECOVERY_SHEET);
+  assert.equal(h.values.LOG_SHEET_NAME, '蚕ログ');
+  const previous = JSON.parse(h.values.YOSAN_LOG_PREVIOUS_V1);
+  assert.equal(previous.spreadsheetId, 'old-private-sheet');
+  assert.equal(previous.logSheetName, 'old-log');
+  for (const key of Object.keys(before)) {
+    if (!['SPREADSHEET_ID', 'LOG_SHEET_NAME'].includes(key)) assert.equal(h.values[key], before[key], key);
+  }
+  assert.equal(h.calls.propertyBatches[0].deleteAllOthers, false);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.driveFileScans.length, 0);
+  assert.ok(h.calls.scopes.every(c => !c.scopes.some(scope => scope.includes('youtube'))));
+});
+
+test('復旧設定を再実行しても元の保存先の控えを上書きしない', () => {
+  const h = preparedSchool({ sheetData: [LOG_HEADERS] });
+  h.context.configureLogSpreadsheet();
+  const backup = h.values.YOSAN_LOG_PREVIOUS_V1;
+  assert.equal(JSON.parse(backup).spreadsheetId, '1VPDVJkFTzF1-71p377QwurQJVmVIVjW2vXOczi7VaGc');
+  h.advance(3600000);
+  h.context.configureLogSpreadsheet();
+  assert.equal(h.values.YOSAN_LOG_PREVIOUS_V1, backup);
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('新しいシートへのアクセス拒否では設定も投稿状態も変更しない', () => {
+  const h = preparedSchool({ spreadsheetOpenError: new Error('リクエストされたドキュメントにアクセスする権限がありません。') });
+  const before = JSON.stringify(h.values);
+  assert.throws(() => h.context.configureLogSpreadsheet(), e => e.logReason === 'LOG_ACCESS_DENIED' && e.message.includes('編集者'));
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.headerWrites, 0);
+  assert.equal(h.calls.releases, 1);
+});
+
+test('新しいシートが閲覧だけの場合も書込み確認が失敗し切り替えない', () => {
+  const h = preparedSchool({ sheetData: [LOG_HEADERS], sheetWriteError: new Error('You do not have permission to edit this document') });
+  const before = JSON.stringify(h.values);
+  assert.throws(() => h.context.configureLogSpreadsheet(), e => e.logReason === 'LOG_ACCESS_DENIED');
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.propertyBatches.length, 0);
+});
+
+test('復旧先の見出し違いと保存確定の失敗では保存先を切り替えない', () => {
+  for (const options of [{ sheetData: [['違う見出し']] }, { sheetData: [LOG_HEADERS], flushFailures: 1 }, {}]) {
+    const h = preparedSchool(options);
+    const before = JSON.stringify(h.values);
+    assert.throws(() => h.context.configureLogSpreadsheet());
+    assert.equal(JSON.stringify(h.values), before);
+    assert.equal(h.calls.propertyBatches.length, 0);
+    assert.equal(h.calls.logs.length, 0);
+  }
+});
+
+test('復旧設定のロック競合中は保存先を変えず後で実行する案内を出す', () => {
+  const h = preparedSchool({ busy: true, sheetData: [LOG_HEADERS] });
+  const before = JSON.stringify(h.values);
+  assert.equal(h.context.configureLogSpreadsheet().status, 'busy');
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.sheetOpens.length, 0);
+});
+
+test('復旧設定のプロパティ保存エラーをシートのアクセス拒否と誤判定しない', () => {
+  const h = preparedSchool({ sheetData: [LOG_HEADERS], failPropertyWrite: key => key === 'SPREADSHEET_ID' });
+  assert.throws(() => h.context.configureLogSpreadsheet(), e => e.message.includes('property storage failure') && !e.logReason);
+  assert.equal(h.values.SPREADSHEET_ID, undefined);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('提示されたアクセス拒否後は新しい保存先で解析結果を再利用して投稿を準備できる', () => {
+  const h = preparedSchool({ sheetData: [LOG_HEADERS], properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    spreadsheetOpenError: id => id === RECOVERY_SHEET ? null : new Error('リクエストされたドキュメントにアクセスする権限がありません。'),
+    geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), e => e.logReason === 'LOG_ACCESS_DENIED');
+  assert.equal(h.state().logged, false);
+  assert.equal(h.state().logImage.name, 'screenshot.png');
+  const feeling = h.state().feeling, key = h.state().analysisKey;
+  const limits = h.values.YOSAN_LIMITS_V1, history = h.values.YOSAN_FEELING_HISTORY_V1;
+  h.context.configureLogSpreadsheet();
+  h.files[0].record.updated += 12345;
+  h.files[0].record.name = 'new-photo.png';
+  const scans = h.calls.driveFileScans.length;
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, feeling);
+  assert.equal(h.state().logged, true);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.driveFileScans.length, scans);
+  assert.deepEqual(h.calls.logs[0], ['2026/11/12 11:00:00', 'screenshot.png', feeling, key]);
+  assert.equal(h.values.YOSAN_LIMITS_V1, limits);
+  assert.equal(h.values.YOSAN_FEELING_HISTORY_V1, history);
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  const personal = personalWithPrepared(h);
+  assert.equal(personal.context.postPreparedCommentToYouTube().youtube, 'sent');
+  assert.equal(personal.calls.chats.length, 1);
+});
+
+test('未記録の解析は最新画像がなくても記録でき、Geminiの待機中でもAPIを呼ばない', () => {
+  const h = preparedSchool({ logFailures: 1, properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), /sheet write failure/);
+  h.files.length = 0;
+  const limits = h.context.getLimitState_();
+  limits.gemini.cooldownSource = 'service';
+  limits.gemini.cooldownUntil = h.now() + 3600000;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  const before = h.values.YOSAN_LIMITS_V1;
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.values.YOSAN_LIMITS_V1, before);
+  assert.equal(h.calls.driveFileScans.length, 1);
+});
+
+test('旧版の未記録データも元の処理IDと解析時刻で保存し未保存の名前を作らない', () => {
+  const h = preparedSchool({ logFailures: 1, properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const state = h.state(); delete state.logImage;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  h.files.length = 0;
+  h.advance(3600000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.logs[0][0], '2026/11/12 11:00:00');
+  assert.equal(h.calls.logs[0][1], '前回の解析画像（ファイル名未保存）');
+  assert.equal(h.calls.logs[0][3], state.analysisKey);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('解析日時がない旧版の未記録データは画像キーの更新時刻を使う', () => {
+  const h = preparedSchool({ logFailures: 1 });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const state = h.state(); delete state.logImage; delete state.generatedAt; delete state.analysisKey;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.logs[0][0], '2026/11/12 10:59:59');
+  assert.equal(h.calls.logs[0][3], state.key);
+});
+
+test('保存待ちの画像情報が壊れている場合は投稿せず情報を消さない', () => {
+  const h = preparedSchool({ logFailures: 1 });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const state = h.state(); state.logImage.key = 'wrong';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  const before = h.values.YOSAN_STATE_V1;
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), e => e.logReason === 'LOG_PENDING_INVALID' && !e.botRetryable);
+  assert.equal(h.values.YOSAN_STATE_V1, before);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('保存待ちでも観察者文や飼育目安に反する改変は記録しない', () => {
+  for (const text of ['蚕たちは元気です。', 'わたし、28度なのに暑くてつらいな。']) {
+    const h = preparedSchool({ logFailures: 1, properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+    assert.throws(() => h.context.analyzeLatestImageAndLog());
+    const state = h.state(); state.feeling = text;
+    h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+    const result = h.context.analyzeLatestImageAndLog();
+    assert.ok(['voice_mismatch', 'care_mismatch'].includes(result.status));
+    assert.equal(h.calls.gemini.length, 1);
+    assert.equal(h.calls.logs.length, 0);
+  }
+});
+
+test('保存待ちがunknownになった場合は保存先を直しても自動再送しない', () => {
+  const h = preparedSchool({ logFailures: 1, properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const state = h.state(); state.youtube = 'unknown';
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  h.context.configureLogSpreadsheet();
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'unknown');
+  assert.equal(h.state().youtube, 'unknown');
+  assert.equal(h.state().logged, false);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('ログ保存の一時障害は予約して再試行し写真が変わっても再解析しない', () => {
+  const h = preparedSchool({ logFailures: 1, properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(first.status, 'temporary_error');
+  assert.equal(first.retryScheduled, true);
+  assert.equal(h.calls.retryDelays[0].ms, 120000);
+  h.advance(120000); h.refreshImage();
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('アクセス拒否が続いても保存を3試行で止め追加のGemini利用を増やさない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)],
+    spreadsheetOpenError: new Error('リクエストされたドキュメントにアクセスする権限がありません。') });
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).retryScheduled, true);
+  h.advance(120000); h.context.retrySchoolAnalysis({ triggerUid: 'retry1' });
+  h.advance(300000); h.context.retrySchoolAnalysis({ triggerUid: 'retry2' });
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.sheetOpens.length, 3);
+  assert.equal(h.calls.retryDelays.length, 2);
+  assert.equal(h.state().logged, false);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'late' }).status, 'no_retry');
+});
+
+test('保存確定後や状態保存失敗からの再試行でも処理IDで重複を避ける', () => {
+  let fail = false;
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)],
+    failPropertyWrite: (key, value) => key === 'YOSAN_STATE_V1' && JSON.parse(value).logged && !fail && (fail = true) });
+  assert.throws(() => h.context.analyzeLatestImageAndLog(), /property storage/);
+  assert.equal(h.state().logged, false);
+  h.files.length = 0;
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.gemini.length, 1);
+  const flushing = preparedSchool({ flushFailures: 1 });
+  assert.throws(() => flushing.context.analyzeLatestImageAndLog(), /flush/);
+  assert.equal(flushing.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(flushing.calls.logs.length, 1);
+  assert.equal(flushing.calls.gemini.length, 1);
+});
+
+test('保存先の見出し違いとGAS認可不足は自動再試行せず別の理由を残す', () => {
+  for (const options of [
+    { sheetData: [['違う見出し']], code: 'LOG_HEADER_MISMATCH' },
+    { spreadsheetOpenError: new Error('You do not have permission to call SpreadsheetApp.openById'), code: 'LOG_AUTH_REQUIRED' }
+  ]) {
+    const h = preparedSchool(options);
+    assert.throws(() => h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }), e => e.logReason === options.code && !e.botRetryable);
+    assert.equal(h.calls.retryDelays.length, 0);
+    assert.equal(JSON.parse(h.values.YOSAN_ISSUES_V1_school).items[0].code, options.code);
+  }
+});
+
+test('状態診断は保存エラーの種類を示し保存先や生のエラーを表示しない', () => {
+  const h = preparedSchool({ spreadsheetOpenError: new Error('リクエストされたドキュメントにアクセスする権限がありません。 private-sheet-id') });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.recentIssues.school[0].status, 'log_error');
+  assert.equal(report.recentIssues.school[0].code, 'LOG_ACCESS_DENIED');
+  assert.equal(report.prepared.logged, false);
+  assert.ok(!h.calls.console.join(' ').includes('private-sheet-id'));
+  assert.ok(!h.values.YOSAN_ISSUES_V1_school.includes('private-sheet-id'));
+});
+
+test('古い解析の保存待ちを手動で復旧した後も予約済み再試行で余分に解析しない', () => {
+  const h = preparedSchool({ logFailures: 2, properties: { ...CARE_PROPERTIES, ...VARIATION_PROPERTIES },
+    geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const key = h.state().analysisKey;
+  h.advance(3600000); h.refreshImage();
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).retryScheduled, true);
+  assert.equal(JSON.parse(h.values.YOSAN_RETRY_V1_school).pendingLogKey, key);
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  h.advance(60000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).alreadyCompleted, true);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('プレビューとDRY_RUNは保存待ちの結果があってもシートに記録しない', () => {
+  for (const dryRun of [true, false]) {
+    const h = preparedSchool({ logFailures: 1 });
+    assert.throws(() => h.context.analyzeLatestImageAndLog());
+    const before = h.values.YOSAN_STATE_V1;
+    h.advance(3600000);
+    if (dryRun) h.values.DRY_RUN = 'true';
+    const result = dryRun ? h.context.analyzeLatestImageAndLog() : h.context.previewSchoolAnalysis();
+    assert.equal(result.status, 'preview');
+    assert.equal(h.calls.logs.length, 0);
+    assert.equal(h.values.YOSAN_STATE_V1, before);
+    assert.equal(h.calls.chats.length, 0);
+  }
 });

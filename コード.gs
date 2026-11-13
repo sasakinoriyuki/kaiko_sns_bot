@@ -9,6 +9,8 @@ const BOT_LIMITS_KEY = 'YOSAN_LIMITS_V1';
 const BOT_PREVIEW_KEY = 'YOSAN_PREVIEW_V1';
 const BOT_YOUTUBE_ERROR_KEY = 'YOSAN_YOUTUBE_LAST_ERROR_V1';
 const BOT_ISSUE_PREFIX = 'YOSAN_ISSUES_V1_';
+const RECOVERY_LOG_SPREADSHEET_ID = '1fEgkHcYNTiRN3KeFKu39wAe2R87QZmqt8cFjXebpPaU';
+const LOG_PREVIOUS_CONFIG_KEY = 'YOSAN_LOG_PREVIOUS_V1';
 const BOT_FEELING_HISTORY_KEY = 'YOSAN_FEELING_HISTORY_V1';
 const FEELING_HISTORY_SIZE = 8;
 const COIN_TOPIC_GAP = 4; // 硬貨・棒・定規など比較用の物に共通の間隔。保存済みカウンター名は互換性のため維持。
@@ -96,6 +98,25 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
     config.manualAnalysisRefresh = Boolean(analysisOnly && refreshFeeling && !triggerDriven);
     config.triggerDriven = Boolean(triggerDriven);
     if (config.triggerDriven) config.youtubeMinMinutes = 1; // 投稿周期は時間主導トリガーが決める。連続実行だけ1分抑制。
+    const properties = PropertiesService.getScriptProperties();
+    const analysisVersion = config.enableRearingContext ? REARING_ANALYSIS_VERSION : LEGACY_ANALYSIS_VERSION;
+    // 記録に失敗した解析を、新しい画像の取得・再解析より先に保存する。
+    if (analysisOnly && !forcePreview && !config.dryRun) {
+      const pending = readJsonProperty_(properties, BOT_STATE_KEY);
+      if (pending && pending.logged === false && pending.feeling && pending.youtube === 'pending' &&
+          pending.analysisVersion === analysisVersion && (!config.enableRearingContext || pending.rearing)) {
+        validateSilkwormVoice_(pending.feeling);
+        validateGroundedFeeling_(pending.feeling, pending.rearing || null);
+        if (config.enableRearingContext) validateRearingFeeling_(pending.feeling, pending.rearing);
+        const logImage = pendingLogImage_(pending);
+        writeImageLog_(config, logImage, pending.feeling);
+        pending.logImage = logImage;
+        pending.logged = true;
+        saveState_(properties, pending);
+        console.log('未保存だった解析結果を記録しました。YouTube投稿は個人アカウント側で実行します。');
+        return { status: 'prepared', youtube: 'queued', feeling: pending.feeling };
+      }
+    }
     const file = findLatestImage_(config.folderId);
     if (!file) {
       console.log('PNG/JPEG画像が見つかりません。');
@@ -120,9 +141,7 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
       base64: Utilities.base64Encode(bytes), mimeType: mimeType
     };
 
-    const properties = PropertiesService.getScriptProperties();
     const preview = readJsonProperty_(properties, BOT_PREVIEW_KEY);
-    const analysisVersion = config.enableRearingContext ? REARING_ANALYSIS_VERSION : LEGACY_ANALYSIS_VERSION;
     const previewCompatible = preview && preview.analysisVersion === analysisVersion &&
       (!config.enableRearingContext || preview.rearing);
     const previewFeeling = previewCompatible && preview.key === image.key && preview.model === config.geminiModel ? preview.feeling : null;
@@ -182,13 +201,13 @@ function runBot_(forcePreview, triggerDriven, analysisOnly, refreshFeeling) {
     }
     validateSilkwormVoice_(state.feeling);
     validateGroundedFeeling_(state.feeling, state.rearing || null);
+    if (!state.logged) state.logImage = {
+      key: state.analysisKey || image.key, name: image.name,
+      modifiedTime: state.generatedAt === undefined ? image.modifiedTime : state.generatedAt
+    };
     saveState_(properties, state);
     if (!state.logged) {
-      const logImage = Object.assign({}, image, {
-        key: state.analysisKey || image.key,
-        modifiedTime: state.generatedAt === undefined ? image.modifiedTime : state.generatedAt
-      });
-      writeImageLog_(config, logImage, state.feeling);
+      writeImageLog_(config, state.logImage, state.feeling);
       state.logged = true;
       saveState_(properties, state);
     }
@@ -825,7 +844,85 @@ function shortenText_(text, limit) {
   return chars.length <= limit ? text : chars.slice(0, limit - 1).join('') + '…';
 }
 
+/** 学校アカウントで1回実行。編集できることを確かめてから保存先だけを切り替える。 */
+function configureLogSpreadsheet() {
+  requireBotScopes_('school', false);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    console.log('他の処理が実行中です。終了後にconfigureLogSpreadsheetを再実行してください。');
+    return { status: 'busy' };
+  }
+  try {
+    try {
+      const sheet = SpreadsheetApp.openById(RECOVERY_LOG_SPREADSHEET_ID).getSheetByName('蚕ログ');
+      const headers = ['日時', '画像ファイル名', '蚕の気持ち', '処理ID'];
+      if (!sheet || sheet.getRange(1, 1, 1, 4).getValues()[0].join('\t') !== headers.join('\t')) {
+        throw logStorageError_(new Error('復旧先の「蚕ログ」の見出しを確認してください。'), 'LOG_HEADER_MISMATCH');
+      }
+      // 閲覧権限だけで切り替わらないよう、既存の見出しを同じ値で書き戻す。
+      sheet.getRange(1, 1, 1, 4).setValues([headers]);
+      SpreadsheetApp.flush();
+    } catch (error) {
+      const storageError = logStorageError_(error);
+      if (storageError.logReason === 'LOG_ACCESS_DENIED') {
+        storageError.message = '復旧先を編集できません。新しいスプレッドシートを、学校側の実行アカウントに編集者として共有してから再実行してください。保存先設定は変更していません。';
+      }
+      throw storageError;
+    }
+    const properties = PropertiesService.getScriptProperties();
+    const previousId = properties.getProperty('SPREADSHEET_ID') || '1VPDVJkFTzF1-71p377QwurQJVmVIVjW2vXOczi7VaGc';
+    const previousName = properties.getProperty('LOG_SHEET_NAME') || '蚕ログ';
+    const updates = { SPREADSHEET_ID: RECOVERY_LOG_SPREADSHEET_ID, LOG_SHEET_NAME: '蚕ログ' };
+    if (previousId !== RECOVERY_LOG_SPREADSHEET_ID || previousName !== '蚕ログ') {
+      updates[LOG_PREVIOUS_CONFIG_KEY] = JSON.stringify({ spreadsheetId: previousId, logSheetName: previousName, changedAt: Date.now() });
+    }
+    properties.setProperties(updates, false);
+    const url = 'https://docs.google.com/spreadsheets/d/' + RECOVERY_LOG_SPREADSHEET_ID + '/edit';
+    console.log('蚕ログの保存先を設定しました: ' + url);
+    console.log('学校側でanalyzeLatestImageAndLogを実行してください。保存待ちの解析があれば再利用します。');
+    return { status: 'configured', url: url };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** 旧版の保存待ちにも対応。ファイル名が残っていなければ、その旨を明記する。 */
+function pendingLogImage_(state) {
+  const key = state.analysisKey || state.key;
+  const saved = state.logImage;
+  const match = typeof state.key === 'string' && state.key.match(/^[^:]+:([0-9]+):[a-f0-9]{64}$/);
+  const modifiedTime = saved ? saved.modifiedTime : state.generatedAt === undefined ? match ? Number(match[1]) : NaN : state.generatedAt;
+  if (typeof key !== 'string' || !key || !Number.isSafeInteger(modifiedTime) || modifiedTime < 0 ||
+      !Number.isFinite(new Date(modifiedTime).getTime()) ||
+      saved && (saved.key !== key || typeof saved.name !== 'string' || !saved.name.trim())) {
+    throw logStorageError_(new Error('保存待ちの画像情報が不正です。投稿状態を消さず、診断ログを確認してください。'), 'LOG_PENDING_INVALID');
+  }
+  return { key: key, name: saved ? saved.name : '前回の解析画像（ファイル名未保存）', modifiedTime: modifiedTime };
+}
+
+function logStorageError_(error, code) {
+  if (error && error.logReason) return error;
+  const message = String(error && error.message || error || '');
+  const authorization = /permission to call|not have permission to call|Authorization is required|認証が必要|認可が必要|呼び出す権限/.test(message);
+  const denied = /アクセスする権限がありません|権限がありません|編集権限|保護された|保護されている|access denied|permission denied|do not have permission|does not have permission|not have access|protected (?:cell|range|sheet)/i.test(message);
+  const reason = code || (authorization ? 'LOG_AUTH_REQUIRED' : denied ? 'LOG_ACCESS_DENIED' : 'LOG_WRITE_FAILED');
+  const result = new Error(reason === 'LOG_ACCESS_DENIED'
+    ? '蚕ログの保存先に編集できません。学校アカウントでconfigureLogSpreadsheetを実行してください。解析結果は保存待ちのまま保持しています。'
+    : message);
+  result.logReason = reason;
+  result.botRetryable = ['LOG_ACCESS_DENIED', 'LOG_WRITE_FAILED'].indexOf(reason) !== -1;
+  return result;
+}
+
 function writeImageLog_(config, image, feeling) {
+  try {
+    return writeImageLogContents_(config, image, feeling);
+  } catch (error) {
+    throw logStorageError_(error);
+  }
+}
+
+function writeImageLogContents_(config, image, feeling) {
   const spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
   let sheet = spreadsheet.getSheetByName(config.logSheetName);
   if (!sheet) sheet = spreadsheet.insertSheet(config.logSheetName);
@@ -833,7 +930,7 @@ function writeImageLog_(config, image, feeling) {
   if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, 4).setValues([headers]);
   const actualHeaders = sheet.getRange(1, 1, 1, 4).getValues()[0];
   if (actualHeaders.join('\t') !== headers.join('\t')) {
-    throw new Error('ログシートの見出しが異なります。LOG_SHEET_NAMEに新しいシート名を指定してください。');
+    throw logStorageError_(new Error('ログシートの見出しが異なります。LOG_SHEET_NAMEに新しいシート名を指定してください。'), 'LOG_HEADER_MISMATCH');
   }
   if (sheet.getLastRow() > 1 && sheet.getRange(2, 4, sheet.getLastRow() - 1, 1)
       .createTextFinder(image.key).matchEntireCell(true).findNext()) return;
@@ -1203,7 +1300,8 @@ function readScheduledRetry_(properties, role) {
       typeof value.pending !== 'boolean' ||
       ['startedAt', 'expiresAt', 'attempts', 'nextAt'].some(function (key) {
         return !Number.isSafeInteger(value[key]) || value[key] < 0;
-      }) || value.attempts > SCHEDULED_MAX_ATTEMPTS || value.expiresAt < value.startedAt) {
+      }) || value.attempts > SCHEDULED_MAX_ATTEMPTS || value.expiresAt < value.startedAt ||
+      value.pendingLogKey !== undefined && (typeof value.pendingLogKey !== 'string' || !value.pendingLogKey)) {
     throw new Error('BOTの再試行予約が不正です。' + role + 'の設定を確認してください。');
   }
   return value;
@@ -1228,7 +1326,9 @@ function runScheduledRole_(role, event, isRetry) {
   if (isRetry) {
     const state = readJsonProperty_(properties, BOT_STATE_KEY);
     const completed = state && (role === 'school'
-      ? state.logged && [REARING_ANALYSIS_VERSION, LEGACY_ANALYSIS_VERSION].indexOf(state.analysisVersion) !== -1 && Number.isFinite(state.generatedAt) && state.generatedAt > window.startedAt
+      ? state.logged && [REARING_ANALYSIS_VERSION, LEGACY_ANALYSIS_VERSION].indexOf(state.analysisVersion) !== -1 &&
+        (Number.isFinite(state.generatedAt) && state.generatedAt > window.startedAt ||
+          window.pendingLogKey && (state.analysisKey || state.key) === window.pendingLogKey)
       : state.youtube !== 'unknown' && state.youtube !== 'sending' && Number.isFinite(state.youtubeSentAt) && state.youtubeSentAt > window.startedAt);
     if (completed) {
       properties.deleteProperty(key);
@@ -1252,6 +1352,12 @@ function runScheduledRole_(role, event, isRetry) {
     }
     console.log(error.message);
     result = { status: 'temporary_error', reason: error.message, retryAt: error.retryAt, retryable: true };
+  }
+  if (role === 'school') {
+    const pending = readJsonProperty_(properties, BOT_STATE_KEY);
+    if (pending && pending.logged === false && pending.feeling && pending.youtube === 'pending') {
+      window.pendingLogKey = pending.analysisKey || pending.key;
+    }
   }
   const current = readScheduledRetry_(properties, role);
   if (!current || current.id !== window.id || current.attempts !== window.attempts) return result;
@@ -1673,6 +1779,8 @@ function rememberBotIssue_(role, error) {
       code = error.groundingReason; status = 'grounding_mismatch';
     } else if (['care_mismatch', 'duplicate_comment'].indexOf(error.botStatus) !== -1) {
       code = error.botStatus; status = error.botStatus;
+    } else if (['LOG_ACCESS_DENIED', 'LOG_AUTH_REQUIRED', 'LOG_HEADER_MISMATCH', 'LOG_WRITE_FAILED', 'LOG_PENDING_INVALID'].indexOf(error.logReason) !== -1) {
+      code = error.logReason; status = 'log_error';
     } else if (role === 'youtube') {
       code = youtubeDiagnostic_(error, '').code;
       status = error.botWait ? 'rate_limited' : 'error';
@@ -1755,11 +1863,12 @@ function diagnoseBotStatus() {
         report.retry[role] = retry ? { pending: retry.pending, attempts: retry.attempts, nextAt: time(retry.nextAt), expiresAt: time(retry.expiresAt) } : null;
       } catch (ignored) { report.retry[role] = { invalid: true }; }
       const issues = read(BOT_ISSUE_PREFIX + role);
-      const statuses = ['voice_mismatch', 'grounding_mismatch', 'care_mismatch', 'duplicate_comment', 'rate_limited', 'api_error', 'error'];
+      const statuses = ['log_error', 'voice_mismatch', 'grounding_mismatch', 'care_mismatch', 'duplicate_comment', 'rate_limited', 'api_error', 'error'];
       const allowedCodes = ['empty_body', 'observer_language', 'missing_feeling', 'missing_first_person', 'ambiguous_subject', 'prefix_too_long',
         'unsupported_story', 'cleaning_not_confirmed', 'repeated_cleaning', 'coin_not_visible', 'coin_not_size_reference', 'coin_unverified_growth',
         'repeated_coin_post', 'repeated_coin_generation', 'scale_not_visible', 'scale_not_size_reference', 'scale_unverified_growth',
-        'care_mismatch', 'duplicate_comment', 'WAIT', 'EXECUTION_ERROR', 'GEMINI_CONNECTION_OR_SERVICE'];
+        'care_mismatch', 'duplicate_comment', 'WAIT', 'EXECUTION_ERROR', 'GEMINI_CONNECTION_OR_SERVICE',
+        'LOG_ACCESS_DENIED', 'LOG_AUTH_REQUIRED', 'LOG_HEADER_MISMATCH', 'LOG_WRITE_FAILED', 'LOG_PENDING_INVALID'];
       report.recentIssues[role] = issues.value && Array.isArray(issues.value.items) ? issues.value.items.slice(-10).map(function (item) {
         const code = item && typeof item.code === 'string' ? item.code : '';
         const youtube = role === 'youtube' ? youtubeDiagnostic_({ message: code }, '').code : 'UNCLASSIFIED';
