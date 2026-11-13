@@ -4515,3 +4515,139 @@ test('プレビューとDRY_RUNは保存待ちの結果があってもシート�
     assert.equal(h.calls.chats.length, 0);
   }
 });
+
+const REPORTED_COIN_UI = { stageText: '蚕3齢（12日目）', temperatureText: '26.5 ℃', humidityText: '93.7 %',
+  cleaningStatusText: null, coinReferenceText: null, scaleReferenceText: '1円玉' };
+const REPORTED_COIN_FEELING = '銀色の硬貨のそばにいると、わたしはなんだか不思議な気分になるな。';
+
+test('報告された硬貨への感想は見送り次の手動解析で道具以外の気持ちを求める', () => {
+  const next = 'わたし、くねった体のまま、もう少しここで休みたいな。';
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse(REPORTED_COIN_FEELING, REPORTED_COIN_UI), careResponse(next, REPORTED_COIN_UI)] });
+  setCoinGap(h, 4);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+  assert.ok(h.calls.console.some(line => line.includes('[coin_not_size_reference]')));
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  const issue = JSON.parse(h.values.YOSAN_ISSUES_V1_school).items[0];
+  assert.equal(issue.code, 'coin_not_size_reference');
+  assert.equal(h.context.recentScaleTopicRejection_(), true);
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, next);
+  assert.equal(h.state().rearing.instar, 3);
+  assert.equal(h.state().rearing.instarDay, 12);
+  assert.equal(h.state().rearing.temperatureC, 26.5);
+  assert.equal(h.state().rearing.humidityPercent, 93.7);
+  assert.equal(h.state().rearing.scaleReferenceText, '1円玉');
+  const prompt = JSON.parse(h.calls.gemini[1].request.payload).systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('今回は大きさ比較も含めて硬貨・棒・定規等を本文に一切使わず'));
+  assert.ok(prompt.includes('蚕自身・仲間・葉・餌・姿勢'));
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('硬貨への感想を見送った自動解析は2分後に別話題で再試行し追加の連続APIを呼ばない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' }, geminiResponses: [
+    careResponse(REPORTED_COIN_FEELING, REPORTED_COIN_UI),
+    careResponse('ぼく、葉のふちに沿ったこの姿勢が好きだな。', REPORTED_COIN_UI)] });
+  setCoinGap(h, 4);
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(first.status, 'grounding_mismatch');
+  assert.equal(first.retryScheduled, true);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.retryDelays[0].ms, 120000);
+  assert.deepEqual(h.calls.sleeps, []);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
+});
+
+test('比較物の見送り後は正しい比較文でも一時的に採用せず硬貨から棒への置換も止める', () => {
+  for (const [feeling, ui] of [[COIN_FEELING, COIN_UI], [ROD_FEELING, ROD_UI]]) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+      careResponse(REPORTED_COIN_FEELING, REPORTED_COIN_UI), careResponse(feeling, ui)] });
+    setCoinGap(h, 4);
+    h.context.analyzeLatestImageAndLog();
+    h.advance(60000);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+    assert.ok(h.calls.console.some(line => line.includes('[scale_topic_paused]')));
+    assert.equal(h.calls.logs.length, 0);
+    const report = h.context.diagnoseBotStatus();
+    assert.equal(report.recentIssues.school[1].code, 'scale_topic_paused');
+    assert.equal(report.recentIssues.school[1].status, 'grounding_mismatch');
+    assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, 4);
+    assert.equal(h.calls.chats.length, 0);
+  }
+});
+
+test('比較物の見送りから1時間後は既存の比較条件を満たす文だけを再び使える', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse(REPORTED_COIN_FEELING, REPORTED_COIN_UI), careResponse(COIN_FEELING, COIN_UI)] });
+  setCoinGap(h, 4);
+  h.context.analyzeLatestImageAndLog();
+  h.advance(3599999);
+  assert.equal(h.context.recentScaleTopicRejection_(), true);
+  h.advance(1);
+  assert.equal(h.context.recentScaleTopicRejection_(), false);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, COIN_FEELING);
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('比較物以外の見送りや未来の時刻だけでは比較物の一時停止をしない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(COIN_FEELING, COIN_UI)] });
+  setCoinGap(h, 4);
+  h.values.YOSAN_ISSUES_V1_school = JSON.stringify({ items: [
+    { at: h.now() - 1000, status: 'voice_mismatch', code: 'missing_feeling' },
+    { at: h.now() + 1000, status: 'grounding_mismatch', code: 'coin_not_size_reference' }
+  ] });
+  assert.equal(h.context.recentScaleTopicRejection_(), false);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+});
+
+test('診断履歴の欠落や破損で新しい実況の生成を止めず履歴も初期化しない', () => {
+  for (const raw of [undefined, '{invalid', '{"items":"invalid"}', '{"items":[null,{"at":"bad","code":"coin_not_size_reference"}]}']) {
+    const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_ISSUES_V1_school: raw },
+      geminiResponses: [careResponse('わたし、この葉っぱのくるんとした形が好きだな。')] });
+    assert.equal(h.context.recentScaleTopicRejection_(), false);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+    assert.equal(h.values.YOSAN_ISSUES_V1_school, raw);
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('比較物の一時停止確認は理由コードだけ読み本文・キー・投稿状態を書き換えない', () => {
+  const h = preparedSchool({ properties: { YOSAN_ISSUES_V1_school: JSON.stringify({ items: [
+    { at: Date.parse('2026-11-12T01:59:00Z'), code: 'scale_not_size_reference' }
+  ] }) } });
+  const before = JSON.stringify(h.values);
+  const properties = h.context.PropertiesService.getScriptProperties();
+  const read = properties.getProperty;
+  properties.getProperties = () => { throw new Error('全プロパティを読まない'); };
+  properties.getProperty = key => { assert.equal(key, 'YOSAN_ISSUES_V1_school'); return read(key); };
+  assert.equal(h.context.recentScaleTopicRejection_(), true);
+  assert.equal(JSON.stringify(h.values), before);
+  assert.equal(h.calls.gemini.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('通常の生成指示でも比較物の観察欄と本文を分け近くにいる感想を禁止する', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('ぼく、このまるまった姿勢が好きだな。', REPORTED_COIN_UI)] });
+  h.context.analyzeLatestImageAndLog();
+  const payload = JSON.parse(h.calls.gemini[0].request.payload);
+  const prompt = payload.systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('観察記録専用で、feelingの話題の指定ではない'));
+  assert.ok(prompt.includes('比較用の物そのものへの感想も書かない'));
+  assert.equal(payload.generationConfig.maxOutputTokens, 512);
+  assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.equal(h.calls.logs.length, 1);
+  assert.ok(!h.calls.console.some(line => line.includes('[scale_topic_paused]')));
+});
