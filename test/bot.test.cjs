@@ -4092,7 +4092,7 @@ test('飼育目安で見送った自動解析も別実行で再確認し診断�
   assert.equal(result.status, 'care_mismatch');
   assert.equal(result.retryScheduled, true);
   const report = h.context.diagnoseBotStatus();
-  assert.equal(report.recentIssues.school[0].code, 'care_mismatch');
+  assert.equal(report.recentIssues.school[0].code, 'care_hot_unconfirmed');
   assert.equal(report.retry.school.pending, true);
   assert.equal(report.retry.school.attempts, 1);
   assert.equal(h.calls.gemini.length, 1);
@@ -4650,4 +4650,182 @@ test('通常の生成指示でも比較物の観察欄と本文を分け近く�
   assert.equal(h.calls.gemini.length, 1);
   assert.equal(h.calls.logs.length, 1);
   assert.ok(!h.calls.console.some(line => line.includes('[scale_topic_paused]')));
+});
+
+const REPORTED_CARE_UI = { ...REPORTED_COIN_UI, temperatureText: '25.5 ℃', humidityText: '84.0 %',
+  scaleReferenceText: '1円硬貨が置かれている' };
+
+test('報告された25.5℃84％でも数値を読み上げず本人の気持ちを準備できる', () => {
+  const feeling = 'ぼく、このくねっとした姿勢のまま少し休みたいな。';
+  const h = preparedSchool({ now: Date.parse('2026-11-13T04:28:53Z'), properties: CARE_PROPERTIES,
+    geminiResponses: [careResponse(feeling, REPORTED_CARE_UI)] });
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'prepared');
+  assert.equal(h.state().feeling, feeling);
+  assert.equal(h.state().rearing.temperatureC, 25.5);
+  assert.equal(h.state().rearing.humidityPercent, 84);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.retryDelays.length, 0);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('飼育目安の各不一致は具体的な理由コードと候補文をログに出す', () => {
+  const cases = [
+    ['care_hot_unconfirmed', 'ぼく、暑くてつらいな。', {}],
+    ['care_cold_unconfirmed', 'ぼく、寒くてつらいな。', {}],
+    ['care_humidity_complaint', 'わたし、湿っぽくていやだな。', {}],
+    ['care_humidity_complaint', 'ぼく、湿度が高くてつらいな。', {}],
+    ['care_dangerous_comfort', 'ぼく、ここは快適でうれしいな。', { temperatureText: '35℃' }],
+    ['care_comfort_unconfirmed', 'ぼく、この温度が快適でうれしいな。', {}],
+    ['care_temperature_mismatch', 'わたし、28℃のお部屋でもう少し休みたいな。', {}],
+    ['care_humidity_mismatch', 'ぼく、湿度75%なのが気になるな。', {}],
+    ['care_instar_mismatch', 'ぼく、2齢のこの模様がお気に入りだよ。', {}],
+    ['care_day_mismatch', 'わたし、13日目の今日はここで休みたいな。', {}],
+    ['care_sleeping_feeding', 'ぼく、もぐもぐ食べていたいな。', { stageText: '3眠' }]
+  ];
+  for (const [code, feeling, ui] of cases) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling, { ...REPORTED_CARE_UI, ...ui })] });
+    const result = h.context.analyzeLatestImageAndLog();
+    assert.equal(result.status, 'care_mismatch', code);
+    assert.ok(h.calls.console.some(line => line.includes('飼育目安チェック不採用 [' + code + ']: ' + JSON.stringify(feeling))), code);
+    assert.ok(result.reason.includes('理由:'), code);
+    const report = h.context.diagnoseBotStatus();
+    assert.equal(report.recentIssues.school[0].status, 'care_mismatch');
+    assert.equal(report.recentIssues.school[0].code, code);
+    assert.ok(!h.values.YOSAN_ISSUES_V1_school.includes(feeling));
+    assert.equal(h.calls.logs.length, 0);
+    assert.equal(h.calls.chats.length, 0);
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('13時28分の飼育目安見送り後は別の話題を求め2分後の再試行で記録を完了する', () => {
+  const feeling = 'わたし、まるまった体を少しゆるめて休みたいな。';
+  const h = preparedSchool({ now: Date.parse('2026-11-13T04:28:53Z'),
+    properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' }, geminiResponses: [
+      careResponse('ぼく、快適な温度でうれしいな。', REPORTED_CARE_UI), careResponse(feeling, REPORTED_CARE_UI)] });
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(first.status, 'care_mismatch');
+  assert.equal(first.retryScheduled, true);
+  assert.equal(h.calls.retryDelays[0].ms, 120000);
+  assert.equal(h.calls.gemini.length, 1);
+  assert.deepEqual(h.calls.sleeps, []);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  const payload = JSON.parse(h.calls.gemini[1].request.payload);
+  const prompt = payload.systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('直近1時間に飼育目安と本文の不一致で見送りがあった'));
+  assert.ok(prompt.includes('今回はfeelingに温湿度・令・日数の数値や'));
+  assert.ok(prompt.includes('飼育UIは各観察欄へこれまでどおり正確に転記'));
+  assert.equal(payload.generationConfig.maxOutputTokens, 512);
+  assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
+  assert.equal(h.state().feeling, feeling);
+  assert.equal(h.state().rearing.temperatureC, 25.5);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
+  assert.equal(h.values.YOSAN_RETRY_V1_school, undefined);
+});
+
+test('以前の一括care_mismatch履歴も次の生成の話題切り替えに使う', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES,
+    geminiResponses: [careResponse('わたし、この体の曲がり方が好きだな。', REPORTED_CARE_UI)] });
+  h.values.YOSAN_ISSUES_V1_school = JSON.stringify({ items: [{ at: h.now() - 1000, status: 'care_mismatch', code: 'care_mismatch' }] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const prompt = JSON.parse(h.calls.gemini[0].request.payload).systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('直近1時間に飼育目安と本文の不一致で見送りがあった'));
+  const report = h.context.diagnoseBotStatus();
+  assert.equal(report.recentIssues.school[0].code, 'care_mismatch');
+});
+
+test('飼育目安の見送りが1時間前か未来なら追加の再試行指示を混ぜない', () => {
+  for (const age of [3600000, -1000]) {
+    const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+    h.values.YOSAN_ISSUES_V1_school = JSON.stringify({ items: [{ at: h.now() - age, status: 'care_mismatch', code: 'care_comfort_unconfirmed' }] });
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+    const prompt = JSON.parse(h.calls.gemini[0].request.payload).systemInstruction.parts[0].text;
+    assert.ok(!prompt.includes('直近1時間に飼育目安と本文の不一致で見送りがあった'));
+    assert.equal(h.calls.gemini.length, 1);
+  }
+});
+
+test('再試行の話題切り替えを指示しても数値が正しい有効な本文を新たに拒否しない', () => {
+  const feeling = 'ぼく、25.5℃のお部屋で、もう少しここで休みたいな。';
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('ぼく、暑くてつらいな。', REPORTED_CARE_UI), careResponse(feeling, REPORTED_CARE_UI)] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'care_mismatch');
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, feeling);
+  assert.equal(h.calls.logs.length, 1);
+});
+
+test('飼育目安と硬貨の見送りが続いても両方の指示を保ち最大3試行の範囲で別の本文を記録する', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('ぼく、暑くてつらいな。', REPORTED_CARE_UI),
+    careResponse(REPORTED_COIN_FEELING, REPORTED_CARE_UI),
+    careResponse('わたし、このくねっとした形のまま休みたいな。', REPORTED_CARE_UI)] });
+  setCoinGap(h, 4);
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).retryScheduled, true);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry1' }).retryScheduled, true);
+  h.advance(300000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry2' }).status, 'prepared');
+  const prompt = JSON.parse(h.calls.gemini[2].request.payload).systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('直近1時間に飼育目安と本文の不一致で見送りがあった'));
+  assert.ok(prompt.includes('今回は大きさ比較も含めて硬貨・棒・定規等を本文に一切使わず'));
+  assert.equal(h.calls.gemini.length, 3);
+  assert.equal(h.calls.retryDelays.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('飼育目安の候補文はGASログで70文字に制限し診断履歴へ本文を保存しない', () => {
+  const h = preparedSchool();
+  const feeling = 'ぼく、暑くてつらいな。\n' + '葉'.repeat(100);
+  const error = h.context.rearingMismatch_('care_hot_unconfirmed', feeling);
+  h.context.rememberBotIssue_('school', error);
+  const line = h.calls.console.find(line => line.startsWith('飼育目安チェック不採用'));
+  const candidate = JSON.parse(line.slice(line.indexOf(': ') + 2));
+  assert.equal(Array.from(candidate).length, 70);
+  assert.ok(!candidate.includes('\n'));
+  const saved = JSON.parse(h.values.YOSAN_ISSUES_V1_school);
+  assert.deepEqual(Object.keys(saved.items[0]).sort(), ['at', 'code', 'status']);
+  assert.equal(saved.items[0].code, 'care_hot_unconfirmed');
+  assert.ok(!h.values.YOSAN_ISSUES_V1_school.includes('ぼく'));
+  const before = JSON.stringify(h.values);
+  const printed = h.calls.console.length;
+  h.context.diagnoseBotStatus();
+  assert.equal(JSON.stringify(h.values), before);
+  assert.ok(!h.calls.console.slice(printed).join(' ').includes('暑くて'));
+});
+
+test('知らない飼育理由を保存や診断で生の文字列として漏らさない', () => {
+  const h = preparedSchool();
+  const error = h.context.rearingMismatch_('private-reason-value', 'ぼく、ここで休みたいな。');
+  assert.equal(error.careReason, 'care_mismatch');
+  error.careReason = 'private-reason-value';
+  h.context.rememberBotIssue_('school', error);
+  assert.equal(h.context.diagnoseBotStatus().recentIssues.school[0].code, 'care_mismatch');
+  assert.ok(!h.values.YOSAN_ISSUES_V1_school.includes('private-reason-value'));
+  assert.ok(!h.calls.console.join(' ').includes('private-reason-value'));
+});
+
+test('数値と快適さの指示を明確にしてもモデルと予算と投稿状態をリセットしない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0', GEMINI_MODEL: 'gemini-3.5-flash-lite' },
+    geminiResponses: [careResponse(DREAM_FEELING)] });
+  const limits = h.context.getLimitState_();
+  limits.youtube.nameSequence = 17;
+  limits.youtube.coinFreePosts = 3;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  h.context.analyzeLatestImageAndLog();
+  const prompt = JSON.parse(h.calls.gemini[0].request.payload).systemInstruction.parts[0].text;
+  assert.ok(prompt.includes('適温の範囲・目安と一致しない場合'));
+  assert.ok(prompt.includes('feelingで読み上げる必要はない'));
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  assert.equal(h.values.GEMINI_MODEL, 'gemini-3.5-flash-lite');
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 17);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, 3);
+  assert.equal(h.state().youtube, 'pending');
+  assert.equal(h.calls.chats.length, 0);
 });

@@ -24,6 +24,18 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_FEELING_CHARS = 70;
 const REARING_ANALYSIS_VERSION = 'rearing-scale-v5';
 const LEGACY_ANALYSIS_VERSION = 'first-person-scale-v4';
+const CARE_MISMATCH_REASONS = {
+  care_hot_unconfirmed: '読取温度が34℃以上ではないため、暑い・熱いと断定しない',
+  care_cold_unconfirmed: '読取温度が18℃以下ではないため、寒い・冷たいと断定しない',
+  care_humidity_complaint: '提供資料に湿度の不快の境界がないため、湿り・乾燥への不満を断定しない',
+  care_dangerous_comfort: '読取温度が34℃以上または18℃以下なので、快適と断定しない',
+  care_comfort_unconfirmed: '読取温度がその段階の適温の目安に一致しない、または目安が不明なので、快適と断定しない',
+  care_temperature_mismatch: '本文の温度が画像UIの読取値と異なる、または読取温度が不明',
+  care_humidity_mismatch: '本文の湿度が画像UIの読取値と異なる、または読取湿度が不明',
+  care_instar_mismatch: '本文の令・齢が画像UIの読取結果と異なる、または令が不明',
+  care_day_mismatch: '本文の日目が画像UIの読取結果と異なる、または日数が不明',
+  care_sleeping_feeding: '画像UIが眠の段階なので、食べている描写をしない'
+};
 const DEFAULT_SILKWORM_NAMES = [
   "こはく",
   "まゆ",
@@ -719,6 +731,8 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
   config = config || getConfig_();
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + config.geminiModel + ':generateContent';
   const avoidScaleTopic = recentScaleTopicRejection_();
+  const avoidCareTopic = config.enableRearingContext &&
+    recentSchoolIssue_(Object.keys(CARE_MISMATCH_REASONS).concat(['care_mismatch']));
   const history = recentFeelings_(); // 掃除の話題の間隔は変化モードが無効でも確認する。
   const userPrompt = config.varyFeelings ? variedFeelingPrompt_(history) : 'この画像を参考に、蚕本人の一人称の気持ちだけを一言お願いします。';
   const payload = {
@@ -748,6 +762,12 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
       .replace('日本語の一言を70文字以内で返してください。', 'JSONのfeeling欄に日本語の一言を70文字以内で入れてください。')
       .replace('引用符・見出し・ハッシュタグを付けないでください。', 'feeling本文に引用符・見出し・ハッシュタグを付けないでください。');
     payload.systemInstruction.parts[0].text += rearingPrompt_();
+    if (avoidCareTopic) {
+      payload.systemInstruction.parts[0].text +=
+        '直近1時間に飼育目安と本文の不一致で見送りがあった。今回はfeelingに温湿度・令・日数の数値や、暑さ寒さ・湿り乾燥への不満・環境が快適との断定を使わない。' +
+        '飼育UIは各観察欄へこれまでどおり正確に転記し、本文は実際に見える蚕の姿勢・体の形・仲間との配置・葉や餌から、本人の好みや小さな願いを一つ選ぶ。' +
+        '比較用の硬貨・棒・定規や掃除を代わりの定番にせず、それぞれの話題の制限も守る。';
+    }
     payload.contents[0].parts[0].text += ' 出力は指定のJSONのみ。UI表示は転記欄、気持ち本文はfeeling欄に入れる。';
     payload.generationConfig.maxOutputTokens = 512;
     payload.generationConfig.responseMimeType = 'application/json';
@@ -1780,7 +1800,9 @@ function rememberBotIssue_(role, error) {
         'scale_unverified_growth', 'scale_topic_paused'].indexOf(error.groundingReason) !== -1) {
       code = error.groundingReason; status = 'grounding_mismatch';
     } else if (['care_mismatch', 'duplicate_comment'].indexOf(error.botStatus) !== -1) {
-      code = error.botStatus; status = error.botStatus;
+      code = error.botStatus === 'care_mismatch' && Object.prototype.hasOwnProperty.call(CARE_MISMATCH_REASONS, error.careReason)
+        ? error.careReason : error.botStatus;
+      status = error.botStatus;
     } else if (['LOG_ACCESS_DENIED', 'LOG_AUTH_REQUIRED', 'LOG_HEADER_MISMATCH', 'LOG_WRITE_FAILED', 'LOG_PENDING_INVALID'].indexOf(error.logReason) !== -1) {
       code = error.logReason; status = 'log_error';
     } else if (role === 'youtube') {
@@ -1870,7 +1892,7 @@ function diagnoseBotStatus() {
         'unsupported_story', 'cleaning_not_confirmed', 'repeated_cleaning', 'coin_not_visible', 'coin_not_size_reference', 'coin_unverified_growth',
         'repeated_coin_post', 'repeated_coin_generation', 'scale_not_visible', 'scale_not_size_reference', 'scale_unverified_growth',
         'care_mismatch', 'duplicate_comment', 'WAIT', 'EXECUTION_ERROR', 'GEMINI_CONNECTION_OR_SERVICE', 'scale_topic_paused',
-        'LOG_ACCESS_DENIED', 'LOG_AUTH_REQUIRED', 'LOG_HEADER_MISMATCH', 'LOG_WRITE_FAILED', 'LOG_PENDING_INVALID'];
+        'LOG_ACCESS_DENIED', 'LOG_AUTH_REQUIRED', 'LOG_HEADER_MISMATCH', 'LOG_WRITE_FAILED', 'LOG_PENDING_INVALID'].concat(Object.keys(CARE_MISMATCH_REASONS));
       report.recentIssues[role] = issues.value && Array.isArray(issues.value.items) ? issues.value.items.slice(-10).map(function (item) {
         const code = item && typeof item.code === 'string' ? item.code : '';
         const youtube = role === 'youtube' ? youtubeDiagnostic_({ message: code }, '').code : 'UNCLASSIFIED';
@@ -2164,6 +2186,8 @@ function rearingPrompt_() {
     '湿度の許容範囲は資料にない。目安との差だけで湿っぽい・ジメジメ・ムシムシ・蒸れる・空気が乾いてつらいと言わない。' +
     '通常の適温付近では暑い・寒い・冷え等の語を否定表現も含めて避け、別の話題を選ぶ。資料にある明確な低温は18℃以下、高温の危険域は34℃以上。' +
     '危険域を快適・ちょうどよいと表現しない。眠や脱皮中に動かないことは病気と決めつけず、食べている描写をしない。' +
+    '読取温度がその段階の適温の範囲・目安と一致しない場合や目安が不明な場合は、快適・温度がちょうどよいと断定せず、姿勢や仲間など別の話題を選ぶ。' +
+    '観察欄へ転記した温湿度・令・日数をfeelingで読み上げる必要はない。本文で使う場合は転記した数値と必ず一致させる。' +
     '気持ちは写真で見える特徴をもとに擬人化し、食事や温湿度ばかりにせず、配置・仲間・居場所・独り言・問いかけなどを変える。' +
     'cleaningStatusTextには画像UIに清掃・掃除の作業状態が明示されている場合だけ、その表示をそのまま転記する。表示がない・読めない・写真からの推測だけならnull。' +
     'scaleReferenceTextには大きさ比較用の硬貨・棒・定規等の実物が見える場合だけ、その種類と見え方を短く書く。不明ならnull。チャットやUIの文字だけを根拠にしない。' +
@@ -2256,39 +2280,44 @@ function rearingReference_(observation) {
     temperatureRange: instar <= 3 ? [27, 29] : null };
 }
 
-function rearingMismatch_() {
-  const error = waitError_('画像UI・飼育目安と合わない温湿度や日数の表現があるため、投稿せず次の解析を待ちます。');
+function rearingMismatch_(reason, feeling) {
+  const code = Object.prototype.hasOwnProperty.call(CARE_MISMATCH_REASONS, reason) ? reason : 'care_mismatch';
+  const candidate = typeof feeling === 'string' ? shortenText_(feeling.replace(/\s+/g, ' '), MAX_FEELING_CHARS) : '';
+  console.log('飼育目安チェック不採用 [' + code + ']: ' + JSON.stringify(candidate));
+  const description = CARE_MISMATCH_REASONS[code] || '温湿度・令・日数と本文の整合性を確認';
+  const error = waitError_('画像UI・飼育目安と合わない温湿度や日数の表現があるため、投稿せず次の解析を待ちます。理由: ' + description);
   error.botStatus = 'care_mismatch';
+  error.careReason = code;
   return error;
 }
 
 function validateRearingFeeling_(feeling, observation) {
   const text = feeling.normalize('NFKC');
   const temperature = observation.temperatureC;
-  if (/(暑|あつい|熱い|熱く|熱すぎ|灼熱|焼けそう)/.test(text) && !(temperature !== null && temperature >= 34)) throw rearingMismatch_();
-  if (/(寒|さむ|冷え|ひえ|冷た|ひんやり|ヒンヤリ|凍え|こごえ)/.test(text) && !(temperature !== null && temperature <= 18)) throw rearingMismatch_();
-  if (/(じめじめ|ジメジメ|じとじと|ジトジト|むしむし|ムシムシ|湿っぽ|湿気で|蒸れ|蒸し暑|ベタベタ|べたべた|空気がカラカラ|乾燥して(?:つら|辛|苦))/.test(text)) throw rearingMismatch_();
-  if (/(?:湿度|湿気).{0,12}(?:つら|辛|苦|イヤ|いや|不快|高すぎ|低すぎ|たまら)/.test(text)) throw rearingMismatch_();
+  if (/(暑|あつい|熱い|熱く|熱すぎ|灼熱|焼けそう)/.test(text) && !(temperature !== null && temperature >= 34)) throw rearingMismatch_('care_hot_unconfirmed', feeling);
+  if (/(寒|さむ|冷え|ひえ|冷た|ひんやり|ヒンヤリ|凍え|こごえ)/.test(text) && !(temperature !== null && temperature <= 18)) throw rearingMismatch_('care_cold_unconfirmed', feeling);
+  if (/(じめじめ|ジメジメ|じとじと|ジトジト|むしむし|ムシムシ|湿っぽ|湿気で|蒸れ|蒸し暑|ベタベタ|べたべた|空気がカラカラ|乾燥して(?:つら|辛|苦))/.test(text)) throw rearingMismatch_('care_humidity_complaint', feeling);
+  if (/(?:湿度|湿気).{0,12}(?:つら|辛|苦|イヤ|いや|不快|高すぎ|低すぎ|たまら)/.test(text)) throw rearingMismatch_('care_humidity_complaint', feeling);
   if (temperature !== null && (temperature >= 34 || temperature <= 18) &&
-      /(快適|ばっちり|バッチリ|ちょうどい|居心地がい|過ごしやす)/.test(text)) throw rearingMismatch_();
+      /(快適|ばっちり|バッチリ|ちょうどい|居心地がい|過ごしやす)/.test(text)) throw rearingMismatch_('care_dangerous_comfort', feeling);
   const reference = observation.reference;
   const comfortableByReference = temperature !== null && reference.temperatureC !== null &&
     (reference.temperatureRange
       ? temperature >= reference.temperatureRange[0] && temperature <= reference.temperatureRange[1]
       : temperature === reference.temperatureC);
-  if (/(快適|温度.{0,8}ちょうど|温湿度.{0,8}ばっちり|温度.{0,8}いい感じ)/.test(text) && !comfortableByReference) throw rearingMismatch_();
+  if (/(快適|温度.{0,8}ちょうど|温湿度.{0,8}ばっちり|温度.{0,8}いい感じ)/.test(text) && !comfortableByReference) throw rearingMismatch_('care_comfort_unconfirmed', feeling);
   const temperatures = Array.from(text.matchAll(/([+-]?\d+(?:\.\d+)?)\s*(?:℃|°\s*C|度)/g));
-  if (temperatures.some(function (match) { return temperature === null || Number(match[1]) !== temperature; })) throw rearingMismatch_();
+  if (temperatures.some(function (match) { return temperature === null || Number(match[1]) !== temperature; })) throw rearingMismatch_('care_temperature_mismatch', feeling);
   const humidities = Array.from(text.matchAll(/(\d+(?:\.\d+)?)\s*(?:%|パーセント)/g));
-  if (humidities.some(function (match) { return observation.humidityPercent === null || Number(match[1]) !== observation.humidityPercent; })) throw rearingMismatch_();
+  if (humidities.some(function (match) { return observation.humidityPercent === null || Number(match[1]) !== observation.humidityPercent; })) throw rearingMismatch_('care_humidity_mismatch', feeling);
   const stages = Array.from(text.matchAll(/([1-5一二三四五])\s*[令齢]/g));
-  if (stages.some(function (match) { return japaneseDayNumber_(match[1]) !== observation.instar; })) throw rearingMismatch_();
+  if (stages.some(function (match) { return japaneseDayNumber_(match[1]) !== observation.instar; })) throw rearingMismatch_('care_instar_mismatch', feeling);
   const days = Array.from(text.matchAll(/([0-9一二三四五六七八九十]+)\s*日目/g));
   if (days.some(function (match) {
     const value = japaneseDayNumber_(match[1]);
     return value === null || !Number.isFinite(value) || value !== observation.instarDay && value !== observation.hatchDay;
-  })) throw rearingMismatch_();
-  if (observation.phase === 'sleeping' && /(もぐもぐ|モグモグ|むしゃむしゃ|ムシャムシャ|食べて|食べる|モリモリ|もりもり)/.test(text)) throw rearingMismatch_();
+  })) throw rearingMismatch_('care_day_mismatch', feeling);
+  if (observation.phase === 'sleeping' && /(もぐもぐ|モグモグ|むしゃむしゃ|ムシャムシャ|食べて|食べる|モリモリ|もりもり)/.test(text)) throw rearingMismatch_('care_sleeping_feeding', feeling);
 }
 
 
@@ -2337,12 +2366,9 @@ function validateCoinPostingInterval_(feeling) {
 }
 
 /** 理由コードだけを読む。診断履歴の欠落・破損で通常の解析を止めない。 */
-function recentScaleTopicRejection_() {
+function recentSchoolIssue_(reasons) {
   try {
     const saved = readJsonProperty_(PropertiesService.getScriptProperties(), BOT_ISSUE_PREFIX + 'school');
-    const reasons = ['coin_not_visible', 'coin_not_size_reference', 'coin_unverified_growth',
-      'repeated_coin_post', 'repeated_coin_generation', 'scale_not_visible', 'scale_not_size_reference',
-      'scale_unverified_growth', 'scale_topic_paused'];
     return Boolean(saved && Array.isArray(saved.items) && saved.items.slice(-10).some(function (item) {
       return item && Number.isSafeInteger(item.at) && item.at <= Date.now() &&
         item.at > Date.now() - SCHEDULED_WINDOW_MS && reasons.indexOf(item.code) !== -1;
@@ -2350,6 +2376,12 @@ function recentScaleTopicRejection_() {
   } catch (ignored) {
     return false;
   }
+}
+
+function recentScaleTopicRejection_() {
+  return recentSchoolIssue_(['coin_not_visible', 'coin_not_size_reference', 'coin_unverified_growth',
+    'repeated_coin_post', 'repeated_coin_generation', 'scale_not_visible', 'scale_not_size_reference',
+    'scale_unverified_growth', 'scale_topic_paused']);
 }
 
 function coinFeelingPrompt_(history, avoidScaleTopic) {
