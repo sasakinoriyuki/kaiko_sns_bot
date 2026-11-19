@@ -20,7 +20,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
   let now = options.now ?? Date.parse('2026-11-12T02:00:00Z');
-  const calls = { sheetOpens: [], headerWrites: 0, propertyBatches: [], retryDelays: [], triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
+  const calls = { random: [], sheetOpens: [], headerWrites: 0, propertyBatches: [], retryDelays: [], triggerIntervals: [], gemini: [], sleeps: [], searches: [], broadcasts: [], videos: [], channels: 0,
     channelRequests: [], playlists: [], scopes: [], driveFileScans: [], driveFolderScans: [], instagram: [], publicImages: [], chats: [], uploads: [], tweets: [], logs: [], console: [], flushes: 0, releases: 0 };
   const values = { ENABLE_REARING_CONTEXT: 'false', GEMINI_API_KEY: 'test-gemini-key', DRY_RUN: 'false', ENABLE_X: 'true',
     TWITTER_API_KEY: 'test-consumer', TWITTER_API_SECRET: 'test-consumer-secret',
@@ -134,7 +134,13 @@ function harness(options = {}) {
     }
   };
   const triggers = [...(options.triggers || [])].map((handler) => ({ getHandlerFunction: () => handler }));
+  const randomValues = [...(options.randomValues || [])];
   const context = createContext({
+    Math: Object.assign(Object.create(Math), { random: () => {
+      const value = randomValues.length ? randomValues.shift() : options.randomDefault ?? 0;
+      calls.random.push(value);
+      return value;
+    } }),
     console: {
       log: (...args) => calls.console.push(args.join(' ')),
       error: (...args) => calls.console.push(args.join(' '))
@@ -4830,39 +4836,41 @@ test('数値と快適さの指示を明確にしてもモデルと予算と投�
   assert.equal(h.calls.chats.length, 0);
 });
 
-test('わたしが続く履歴では次の一人称をぼくにする', () => {
-  const h = preparedSchool();
-  assert.equal(h.context.preferredFirstPerson_([]), 'ぼく');
-  assert.equal(h.context.preferredFirstPerson_(Array(8).fill('わたし、ここで休みたいな。')), 'ぼく');
-  assert.equal(h.context.preferredFirstPerson_(['ぼく、ここが好き。', 'ぼく、休みたい。', 'わたし、葉が好き。', 'ぼく、仲間のそばが好き。']), 'ぼく');
-  assert.equal(h.context.preferredFirstPerson_(Array(4).fill('ぼく、葉っぱが好きだな。')), 'わたし');
+test('一人称は50:50の独立した抽選で選び同じ一人称の連続も許容する', () => {
+  const draws = [0, 0.499999, 0.5, 0.999999, 0.8, 0.1];
+  const h = preparedSchool({ randomValues: draws });
+  assert.deepEqual(draws.map(() => h.context.randomFirstPerson_()), ['ぼく', 'ぼく', 'わたし', 'わたし', 'わたし', 'ぼく']);
+  assert.deepEqual(h.calls.random, draws);
+  assert.equal(h.calls.gemini.length, 0);
 });
 
-test('AIが50回すべてわたしを返しても新しい採用文はぼく40回わたし10回になる', () => {
+test('AIがわたしを返し続けても抽選した一人称を使い固定の4対1や交互順にはしない', () => {
   const bodies = ['この葉のふちが好きだな。', '丸まった姿勢で休みたいな。', '仲間のそばで過ごしたいな。',
     '葉のくねった形が気になるな。', 'からだを少しゆるめたい気分。', 'ここで一息つこうかな。',
     '葉っぱの先の形がお気に入り。', 'この姿勢でもう少しのんびりしたいな。'];
-  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_FEELING_VARIATION: 'false', GEMINI_DAILY_REQUEST_BUDGET: '0' },
+  const firstPersonDraws = Array.from({ length: 50 }, (_, i) => [0.78, 0.92, 0.1, 0.66, 0.03, 0.12, 0.9, 0.4, 0.8, 0.2][i % 10]);
+  const h = preparedSchool({ randomValues: firstPersonDraws.flatMap((value, i) => [value, (i % 6 + 0.5) / 6]), properties: { ...CARE_PROPERTIES, ENABLE_FEELING_VARIATION: 'false', GEMINI_DAILY_REQUEST_BUDGET: '0' },
     geminiResponses: Array.from({ length: 50 }, (_, i) => careResponse('わたし、' + bodies[i % bodies.length])) });
   const generated = [];
   for (let i = 0; i < 50; i++) {
     if (i) h.advance(3600000);
     assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
     generated.push(h.state().feeling);
-    const expected = (i + 1) % 5 === 0 ? 'わたし' : 'ぼく';
+    const expected = firstPersonDraws[i] < 0.5 ? 'ぼく' : 'わたし';
     assert.ok(h.state().feeling.startsWith(expected + '、'));
     assert.ok(JSON.parse(h.calls.gemini[i].request.payload).systemInstruction.parts[0].text.includes('今回の一人称は「' + expected + '」'));
   }
-  assert.equal(generated.filter(text => text.startsWith('ぼく、')).length, 40);
-  assert.equal(generated.filter(text => text.startsWith('わたし、')).length, 10);
+  assert.equal(generated.filter(text => text.startsWith('ぼく、')).length, 25);
+  assert.equal(generated.filter(text => text.startsWith('わたし、')).length, 25);
+  assert.equal(h.calls.random.length, 100);
   assert.equal(h.calls.gemini.length, 50);
   assert.equal(h.calls.logs.length, 50);
   assert.equal(h.calls.chats.length, 0);
   assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
 });
 
-test('ぼくが続いた後はAIがぼくを返しても一度わたしにし保存と表示をそろえる', () => {
-  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [
+test('ぼくが続く履歴でも抽選でわたしを選び保存と表示をそろえる', () => {
+  const h = preparedSchool({ randomValues: [0.8, 0.1], properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [
     'ぼく、葉っぱのふちが好き。', 'ぼく、ここで休みたい。', 'ぼく、この姿勢が好き。', 'ぼく、仲間のそばでいたい。'
   ] }) }, geminiResponses: [careResponse('ぼく、体をゆるめてひと休みしたいな。')] });
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
@@ -4917,16 +4925,18 @@ test('過去のわたし本文も一人称だけ変えて新しい実況とし�
   assert.equal(h.calls.gemini.length, 1);
 });
 
-test('見送った生成では一人称の順番を進めず次の再試行でも同じ選択を使う', () => {
+test('見送り時の履歴を保ち再試行では一人称と文末を新しく抽選する', () => {
   const before = ['ぼく、葉っぱが好き。', 'ぼく、休みたい。', 'ぼく、この形が好き。', 'ぼく、仲間のそばが好き。'];
-  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: before }) },
+  const h = preparedSchool({ randomValues: [0.8, 0.9, 0.2, 0.3], properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: before }) },
     geminiResponses: [careResponse('わたしから見ると、蚕たちは元気そうです。'), careResponse('ぼく、からだをゆるめて一息つきたいな。')] });
   assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'voice_mismatch');
   assert.deepEqual(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts, before);
   h.advance(120000);
   assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
-  assert.equal(h.state().feeling, 'わたし、からだをゆるめて一息つきたいな。');
-  assert.ok(h.calls.gemini.every(c => JSON.parse(c.request.payload).systemInstruction.parts[0].text.includes('今回の一人称は「わたし」')));
+  assert.equal(h.state().feeling, 'ぼく、からだをゆるめて一息つきたいな。');
+  assert.ok(JSON.parse(h.calls.gemini[0].request.payload).systemInstruction.parts[0].text.includes('今回の一人称は「わたし」'));
+  assert.ok(JSON.parse(h.calls.gemini[1].request.payload).systemInstruction.parts[0].text.includes('今回の一人称は「ぼく」'));
+  assert.deepEqual(h.calls.random, [0.8, 0.9, 0.2, 0.3]);
   assert.equal(h.calls.gemini.length, 2);
 });
 
@@ -4944,7 +4954,7 @@ test('保存待ちの旧本文は一人称を勝手に変えず再解析なし�
 
 test('一人称が長くなっても最終本文はUnicodeを壊さず70文字以内に保つ', () => {
   const raw = 'ぼく、好きだな。' + '葉'.repeat(62);
-  const h = preparedSchool({ properties: { YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: Array(4).fill('ぼく、休みたいな。') }) },
+  const h = preparedSchool({ randomValues: [0.8, 0.1], properties: { YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: Array(4).fill('ぼく、休みたいな。') }) },
     geminiResponses: [geminiResponse(raw)] });
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.ok(h.state().feeling.startsWith('わたし、'));
@@ -4977,4 +4987,112 @@ test('一人称の調整だけではモデル・上限・名前の順番・ト�
   assert.equal(h.calls.gemini.length, 1);
   assert.ok(h.calls.gemini[0].url.endsWith('/gemini-3.5-flash-lite:generateContent'));
   assert.deepEqual(h.triggers.map(t => t.getHandlerFunction()), ['analyzeLatestImageAndLog']);
+});
+
+test('文末は6種類を同じ広さの区間から選び自問以外ではかなを抑える指示を出す', () => {
+  const draws = Array.from({ length: 6 }, (_, i) => (i + 0.5) / 6);
+  const h = preparedSchool({ randomValues: draws });
+  const expected = ['気持ちを短く言い切る', '柔らかい独り言', '親しみのある言い方', '自分の小さな願い', '短い余韻を残す', '自分に問いかける'];
+  expected.forEach((part, i) => {
+    const prompt = h.context.randomEndingPrompt_();
+    assert.ok(prompt.includes(part), part);
+    assert.equal(prompt.includes('今回は「かな」「かしら」で締めない'), i !== 5);
+  });
+  assert.deepEqual(h.calls.random, draws);
+  assert.equal(h.calls.gemini.length, 0);
+});
+
+test('一人称と文末を別々に抽選し全12通りの組合せを同じ1リクエストへ渡す', () => {
+  for (const personDraw of [0.1, 0.9]) for (let ending = 0; ending < 6; ending++) {
+    const h = preparedSchool({ randomValues: [personDraw, (ending + 0.5) / 6], properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+      geminiResponses: [careResponse('わたし、この葉っぱの曲がり方が好きだな。')] });
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+    const request = JSON.parse(h.calls.gemini[0].request.payload);
+    const prompt = request.systemInstruction.parts[0].text;
+    const person = personDraw < 0.5 ? 'ぼく' : 'わたし';
+    assert.ok(prompt.includes('今回の一人称は「' + person + '」'));
+    assert.ok(prompt.includes('今回の文末の方針:'));
+    assert.equal(prompt.includes('今回は「かな」「かしら」で締めない'), ending !== 5);
+    assert.ok(h.state().feeling.startsWith(person + '、'));
+    assert.equal(request.generationConfig.maxOutputTokens, 512);
+    assert.equal(request.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
+    assert.equal(h.calls.gemini.length, 1);
+    assert.equal(h.calls.logs.length, 1);
+    assert.equal(h.calls.chats.length, 0);
+    assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 1);
+    assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  }
+});
+
+test('共通の例文からかなへの誘導を減らし文体候補でも自問を強制しない', () => {
+  const h = preparedSchool({ randomValues: [0.1, 0.1], properties: CARE_PROPERTIES,
+    geminiResponses: [careResponse('ぼく、この姿勢が好きだな。')] });
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify({ gemini: { day: h.context.quotaDay_(), count: 2 } });
+  h.context.analyzeLatestImageAndLog();
+  const payload = JSON.parse(h.calls.gemini[0].request.payload);
+  const prompt = payload.systemInstruction.parts[0].text;
+  assert.ok(!prompt.includes('わたしはどんな夢をみようかな。'));
+  assert.ok(!prompt.includes('ぼく、ここで一息つこうかな。'));
+  assert.ok(payload.contents[0].parts[0].text.includes('自分の好みや願望を素朴に表す'));
+  assert.ok(prompt.includes('気持ちを短く言い切る'));
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('かな無しの明確な意向も一人称の心の声として採用し語尾を書き換えない', () => {
+  for (const feeling of ['ぼく、ここで一息つこう。', 'わたし、今日はこの姿勢で休もう。',
+    'ぼく、ここで少し丸まろう。', 'わたし、この場所でどんな夢をみよう。']) {
+    const h = preparedSchool({ randomValues: [feeling.startsWith('わたし') ? 0.9 : 0.1, 0.7],
+      properties: CARE_PROPERTIES, geminiResponses: [careResponse(feeling)] });
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+    assert.equal(h.state().feeling, feeling);
+    assert.equal(h.calls.logs[0][2], feeling);
+    assert.equal(h.calls.gemini.length, 1);
+    assert.equal(h.calls.retryDelays.length, 0);
+  }
+});
+
+test('かな無しの意向を認めても数値だけの文や観察者や曖昧な主語を通さない', () => {
+  const h = preparedSchool();
+  for (const feeling of ['ぼく、28℃。', 'わたし、3齢12日目。', 'ぼくから見ると、蚕たちはここで休もう。']) {
+    assert.throws(() => h.context.validateSilkwormVoice_(feeling), e => e.botStatus === 'voice_mismatch');
+  }
+  assert.throws(() => h.context.normalizeSilkwormFeeling_('仲間はここで休もう。', 'ぼく'), e => e.voiceReason === 'ambiguous_subject');
+  assert.equal(h.context.normalizeSilkwormFeeling_('ここで少し休もう。', 'わたし'), 'わたし、ここで少し休もう。');
+});
+
+test('選んだ文末と異なっても有効な自問を無理に変換したり追加APIで作り直したりしない', () => {
+  const h = preparedSchool({ randomValues: [0.9, 0.1], properties: CARE_PROPERTIES,
+    geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, DREAM_FEELING);
+  assert.equal(h.calls.retryDelays.length, 0);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('プレビューの再表示と準備済み表示では一人称も文末も再抽選しない', () => {
+  const h = preparedSchool({ randomValues: [0.9, 0.7, 0.1, 0.1], properties: CARE_PROPERTIES,
+    geminiResponses: [careResponse('わたし、このままここで休みたい。')] });
+  const first = h.context.previewSchoolAnalysis();
+  assert.equal(h.context.previewSchoolAnalysis().feeling, first.feeling);
+  assert.deepEqual(h.calls.random, [0.9, 0.7]);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  const personal = personalWithPrepared(h);
+  personal.context.previewPreparedComment();
+  personal.context.previewPreparedComment();
+  assert.deepEqual(personal.calls.random, []);
+  assert.deepEqual(h.calls.random, [0.9, 0.7]);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('抽選で一人称が変わっても同じ本文を再採用しない', () => {
+  const text = 'わたし、この葉っぱのふちが好きだな。';
+  const h = preparedSchool({ randomValues: [0.1, 0.2, 0.9, 0.8],
+    properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [text] }) },
+    geminiResponses: [careResponse(text), careResponse(text)] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'duplicate_comment');
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'duplicate_comment');
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 0);
+  assert.deepEqual(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts, [text]);
 });
