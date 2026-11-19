@@ -2846,7 +2846,7 @@ test('旧プレビューに残る物語は新しい画像解析で再利用し�
   old.analysisVersion = 'rearing-first-person-v2'; old.feeling = 'ぼく、ひとりで掃除の後の再会が楽しみ。';
   h.values.YOSAN_PREVIEW_V1 = JSON.stringify(old);
   h.advance(3600000);
-  assert.equal(h.context.previewSchoolAnalysis().feeling, 'わたし、ここで体をゆるめたい気分。');
+  assert.equal(h.context.previewSchoolAnalysis().feeling, 'ぼく、ここで体をゆるめたい気分。');
   assert.equal(h.calls.gemini.length, 2);
 });
 
@@ -2874,7 +2874,7 @@ test('学校の手動解析は24回予算でも1分後に同じ写真を解析�
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.state().key, first.key);
   assert.ok(h.state().analysisKey !== first.analysisKey);
-  assert.equal(h.state().feeling, 'わたし、ここで体をゆるめたい気分。');
+  assert.equal(h.state().feeling, 'ぼく、ここで体をゆるめたい気分。');
   assert.equal(h.calls.gemini.length, 2);
   assert.equal(h.calls.logs.length, 2);
   assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).gemini.count, 2);
@@ -2893,7 +2893,7 @@ test('明示的な学校の手動更新は変化モード無効でも新しい�
   h.advance(60000);
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
   assert.equal(h.state().youtube, 'pending');
-  assert.equal(h.state().feeling, 'わたし、ここで体をゆるめたい気分。');
+  assert.equal(h.state().feeling, 'ぼく、ここで体をゆるめたい気分。');
   assert.equal(h.calls.logs.length, 2);
   assert.equal(h.calls.gemini.length, 2);
   assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, 12);
@@ -3204,9 +3204,9 @@ test('従来視聴者を宛先にしていた文体候補でも本人の好み�
   assert.ok(instruction.includes('本人の好みや願望を含む自問'));
   assert.ok(request.systemInstruction.parts[0].text.includes('本人の胸の中だけで完結する独白'));
   assert.equal(h.calls.gemini.length, 1);
-  assert.equal(h.state().feeling, feeling);
+  assert.equal(h.state().feeling, 'ぼく、この葉の形が好きだな。');
   const personal = personalWithPrepared(h);
-  assert.ok(personal.context.previewPreparedComment().messageText.includes('こはく：' + feeling));
+  assert.ok(personal.context.previewPreparedComment().messageText.includes('こはく：ぼく、この葉の形が好きだな。'));
   assert.equal(personal.calls.gemini.length, 0);
 });
 
@@ -4050,11 +4050,11 @@ test('報告された夢の自問は1回の画像解析で準備し日時と名�
       cleaningStatusText: '掃除中・・・・', scaleReferenceText: null
     })] });
   assert.equal(school.context.analyzeLatestImageAndLog().status, 'prepared');
-  assert.equal(school.state().feeling, DREAM_FEELING);
+  assert.equal(school.state().feeling, 'ぼくは静かなこの場所で、どんな夢をみようかな。');
   assert.equal(school.calls.gemini.length, 1);
   const h = personalWithPrepared(school, { now: school.now() });
   assert.equal(h.context.postPreparedCommentToYouTube().youtube, 'sent');
-  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText, '2026/11/12 17:01\nこはく：' + DREAM_FEELING);
+  assert.equal(h.calls.chats[0].payload.snippet.textMessageDetails.messageText, '2026/11/12 17:01\nこはく：ぼくは静かなこの場所で、どんな夢をみようかな。');
   assert.equal(h.calls.gemini.length, 0);
 });
 
@@ -4534,7 +4534,7 @@ test('報告された硬貨への感想は見送り次の手動解析で道具�
   assert.equal(h.context.recentScaleTopicRejection_(), true);
   h.advance(60000);
   assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
-  assert.equal(h.state().feeling, next);
+  assert.equal(h.state().feeling, 'ぼく、くねった体のまま、もう少しここで休みたいな。');
   assert.equal(h.state().rearing.instar, 3);
   assert.equal(h.state().rearing.instarDay, 12);
   assert.equal(h.state().rearing.temperatureC, 26.5);
@@ -4718,7 +4718,7 @@ test('13時28分の飼育目安見送り後は別の話題を求め2分後の再
   assert.ok(prompt.includes('飼育UIは各観察欄へこれまでどおり正確に転記'));
   assert.equal(payload.generationConfig.maxOutputTokens, 512);
   assert.equal(payload.generationConfig.thinkingConfig.thinkingLevel, 'minimal');
-  assert.equal(h.state().feeling, feeling);
+  assert.equal(h.state().feeling, 'ぼく、まるまった体を少しゆるめて休みたいな。');
   assert.equal(h.state().rearing.temperatureC, 25.5);
   assert.equal(h.calls.logs.length, 1);
   assert.equal(h.calls.gemini.length, 2);
@@ -4828,4 +4828,153 @@ test('数値と快適さの指示を明確にしてもモデルと予算と投�
   assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.coinFreePosts, 3);
   assert.equal(h.state().youtube, 'pending');
   assert.equal(h.calls.chats.length, 0);
+});
+
+test('わたしが続く履歴では次の一人称をぼくにする', () => {
+  const h = preparedSchool();
+  assert.equal(h.context.preferredFirstPerson_([]), 'ぼく');
+  assert.equal(h.context.preferredFirstPerson_(Array(8).fill('わたし、ここで休みたいな。')), 'ぼく');
+  assert.equal(h.context.preferredFirstPerson_(['ぼく、ここが好き。', 'ぼく、休みたい。', 'わたし、葉が好き。', 'ぼく、仲間のそばが好き。']), 'ぼく');
+  assert.equal(h.context.preferredFirstPerson_(Array(4).fill('ぼく、葉っぱが好きだな。')), 'わたし');
+});
+
+test('AIが50回すべてわたしを返しても新しい採用文はぼく40回わたし10回になる', () => {
+  const bodies = ['この葉のふちが好きだな。', '丸まった姿勢で休みたいな。', '仲間のそばで過ごしたいな。',
+    '葉のくねった形が気になるな。', 'からだを少しゆるめたい気分。', 'ここで一息つこうかな。',
+    '葉っぱの先の形がお気に入り。', 'この姿勢でもう少しのんびりしたいな。'];
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, ENABLE_FEELING_VARIATION: 'false', GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: Array.from({ length: 50 }, (_, i) => careResponse('わたし、' + bodies[i % bodies.length])) });
+  const generated = [];
+  for (let i = 0; i < 50; i++) {
+    if (i) h.advance(3600000);
+    assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+    generated.push(h.state().feeling);
+    const expected = (i + 1) % 5 === 0 ? 'わたし' : 'ぼく';
+    assert.ok(h.state().feeling.startsWith(expected + '、'));
+    assert.ok(JSON.parse(h.calls.gemini[i].request.payload).systemInstruction.parts[0].text.includes('今回の一人称は「' + expected + '」'));
+  }
+  assert.equal(generated.filter(text => text.startsWith('ぼく、')).length, 40);
+  assert.equal(generated.filter(text => text.startsWith('わたし、')).length, 10);
+  assert.equal(h.calls.gemini.length, 50);
+  assert.equal(h.calls.logs.length, 50);
+  assert.equal(h.calls.chats.length, 0);
+  assert.equal(JSON.parse(h.values.YOSAN_LIMITS_V1).youtube.nameSequence, undefined);
+});
+
+test('ぼくが続いた後はAIがぼくを返しても一度わたしにし保存と表示をそろえる', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [
+    'ぼく、葉っぱのふちが好き。', 'ぼく、ここで休みたい。', 'ぼく、この姿勢が好き。', 'ぼく、仲間のそばでいたい。'
+  ] }) }, geminiResponses: [careResponse('ぼく、体をゆるめてひと休みしたいな。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, 'わたし、体をゆるめてひと休みしたいな。');
+  assert.equal(h.calls.logs[0][2], h.state().feeling);
+  const personal = personalWithPrepared(h);
+  assert.ok(personal.context.previewPreparedComment().messageText.includes('こはく：わたし、体をゆるめてひと休みしたいな。'));
+  assert.equal(personal.calls.gemini.length, 0);
+  assert.equal(personal.calls.chats.length, 0);
+});
+
+test('一人称の置換でも複数形と私物などの熟語を保つ', () => {
+  const h = preparedSchool();
+  const cases = [
+    ['わたしたちの並びが、わたしも好きだな。', 'ぼく', 'ぼくらの並びが、ぼくも好きだな。'],
+    ['ぼくらはここで休みたいな。', 'わたし', 'わたしたちはここで休みたいな。'],
+    ['私たちはこの葉が好きだな。', 'ぼく', 'ぼくらはこの葉が好きだな。'],
+    ['僕たちはこの姿勢が好きだな。', 'わたし', 'わたしたちはこの姿勢が好きだな。'],
+    ['わたしは私物や私語より葉っぱが好き。', 'ぼく', 'ぼくは私物や私語より葉っぱが好き。'],
+    ['ぼくは下僕の物語よりこの葉が好き。', 'わたし', 'わたしは下僕の物語よりこの葉が好き。'],
+    ['おいら、ここで休みたいな。', 'ぼく', 'ぼく、ここで休みたいな。']
+  ];
+  for (const [raw, firstPerson, expected] of cases) {
+    assert.equal(h.context.rewriteFeelingFirstPerson_(raw, firstPerson), expected);
+  }
+});
+
+test('一人称を変えても観察者文や感情のない文を通さない', () => {
+  const h = preparedSchool();
+  for (const firstPerson of ['ぼく', 'わたし']) {
+    assert.throws(() => h.context.normalizeSilkwormFeeling_('わたしから見ると、蚕たちは元気そうです。', firstPerson), e => e.voiceReason === 'observer_language');
+    assert.throws(() => h.context.normalizeSilkwormFeeling_('わたし、28℃、75%です。', firstPerson), e => e.voiceReason === 'missing_feeling');
+    assert.throws(() => h.context.normalizeSilkwormFeeling_('仲間はここで休もうかな。', firstPerson), e => e.voiceReason === 'ambiguous_subject');
+  }
+  assert.equal(h.context.normalizeSilkwormFeeling_('ここで少し休もうかな。', 'わたし'), 'わたし、ここで少し休もうかな。');
+});
+
+test('一人称だけの変更では短い同じ気持ちも重複判定をすり抜けない', () => {
+  const h = preparedSchool();
+  assert.equal(h.context.similarFeelings_('わたし、嬉しい。', 'ぼく、嬉しい。'), true);
+  assert.equal(h.context.similarFeelings_('わたしたち、休みたい。', 'ぼくら、休みたい。'), true);
+  assert.equal(h.context.similarFeelings_('ぼく、葉っぱが好き。', 'わたし、ひと休みしたい。'), false);
+  assert.equal(h.context.normalizeFeeling_('私物が好き。'), '私物が好き');
+});
+
+test('過去のわたし本文も一人称だけ変えて新しい実況として再採用しない', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [
+    'わたし、この葉っぱのふちが好きだな。'
+  ] }) }, geminiResponses: [careResponse('ぼく、この葉っぱのふちが好きだな。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'duplicate_comment');
+  assert.equal(h.calls.logs.length, 0);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('見送った生成では一人称の順番を進めず次の再試行でも同じ選択を使う', () => {
+  const before = ['ぼく、葉っぱが好き。', 'ぼく、休みたい。', 'ぼく、この形が好き。', 'ぼく、仲間のそばが好き。'];
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: before }) },
+    geminiResponses: [careResponse('わたしから見ると、蚕たちは元気そうです。'), careResponse('ぼく、からだをゆるめて一息つきたいな。')] });
+  assert.equal(h.context.analyzeLatestImageAndLog({ triggerUid: 'school' }).status, 'voice_mismatch');
+  assert.deepEqual(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts, before);
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.state().feeling, 'わたし、からだをゆるめて一息つきたいな。');
+  assert.ok(h.calls.gemini.every(c => JSON.parse(c.request.payload).systemInstruction.parts[0].text.includes('今回の一人称は「わたし」')));
+  assert.equal(h.calls.gemini.length, 2);
+});
+
+test('保存待ちの旧本文は一人称を勝手に変えず再解析なしで記録を完了する', () => {
+  const h = preparedSchool({ logFailures: 1, properties: CARE_PROPERTIES, geminiResponses: [careResponse(DREAM_FEELING)] });
+  assert.throws(() => h.context.analyzeLatestImageAndLog());
+  const state = h.state();
+  state.feeling = DREAM_FEELING;
+  h.values.YOSAN_STATE_V1 = JSON.stringify(state);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, DREAM_FEELING);
+  assert.equal(h.calls.logs[0][2], DREAM_FEELING);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('一人称が長くなっても最終本文はUnicodeを壊さず70文字以内に保つ', () => {
+  const raw = 'ぼく、好きだな。' + '葉'.repeat(62);
+  const h = preparedSchool({ properties: { YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: Array(4).fill('ぼく、休みたいな。') }) },
+    geminiResponses: [geminiResponse(raw)] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.ok(h.state().feeling.startsWith('わたし、'));
+  assert.ok(Array.from(h.state().feeling).length <= 70);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('同じプレビュー表示では一人称の選択やAPI回数を進めない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [careResponse('わたし、この葉のふちが好きだな。')] });
+  const first = h.context.previewSchoolAnalysis();
+  const history = h.values.YOSAN_FEELING_HISTORY_V1;
+  assert.equal(first.feeling, 'ぼく、この葉のふちが好きだな。');
+  assert.equal(h.context.previewSchoolAnalysis().feeling, first.feeling);
+  assert.equal(h.values.YOSAN_FEELING_HISTORY_V1, history);
+  assert.equal(h.calls.gemini.length, 1);
+});
+
+test('一人称の調整だけではモデル・上限・名前の順番・トリガーを変更しない', () => {
+  const h = preparedSchool({ triggers: ['analyzeLatestImageAndLog'], properties: { ...CARE_PROPERTIES, GEMINI_DAILY_REQUEST_BUDGET: '0' },
+    geminiResponses: [careResponse('わたし、この葉のくるんとした形がお気に入り。')] });
+  const limits = h.context.getLimitState_();
+  limits.youtube.nameSequence = 17;
+  limits.youtube.coinFreePosts = 3;
+  h.values.YOSAN_LIMITS_V1 = JSON.stringify(limits);
+  h.context.analyzeLatestImageAndLog();
+  const after = JSON.parse(h.values.YOSAN_LIMITS_V1);
+  assert.equal(after.youtube.nameSequence, 17);
+  assert.equal(after.youtube.coinFreePosts, 3);
+  assert.equal(h.values.GEMINI_DAILY_REQUEST_BUDGET, '0');
+  assert.equal(h.calls.gemini.length, 1);
+  assert.ok(h.calls.gemini[0].url.endsWith('/gemini-3.5-flash-lite:generateContent'));
+  assert.deepEqual(h.triggers.map(t => t.getHandlerFunction()), ['analyzeLatestImageAndLog']);
 });
