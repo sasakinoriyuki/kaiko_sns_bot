@@ -13,6 +13,8 @@ const RECOVERY_LOG_SPREADSHEET_ID = '1fEgkHcYNTiRN3KeFKu39wAe2R87QZmqt8cFjXebpPa
 const LOG_PREVIOUS_CONFIG_KEY = 'YOSAN_LOG_PREVIOUS_V1';
 const BOT_FEELING_HISTORY_KEY = 'YOSAN_FEELING_HISTORY_V1';
 const FEELING_HISTORY_SIZE = 8;
+const FEELING_TOPIC_WINDOW = 4;
+const FEELING_TOPIC_LIMIT = 2;
 const COIN_TOPIC_GAP = 4; // 硬貨・棒・定規など比較用の物に共通の間隔。保存済みカウンター名は互換性のため維持。
 const SCHEDULED_RETRY_PREFIX = 'YOSAN_RETRY_V1_';
 const SCHEDULED_MAX_ATTEMPTS = 3;
@@ -735,7 +737,8 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
     recentSchoolIssue_(Object.keys(CARE_MISMATCH_REASONS).concat(['care_mismatch']));
   const history = recentFeelings_(); // 掃除の話題の間隔は変化モードが無効でも確認する。
   const firstPerson = randomFirstPerson_();
-  const userPrompt = config.varyFeelings ? variedFeelingPrompt_(history) : 'この画像を参考に、蚕本人の一人称の気持ちだけを一言お願いします。';
+  const repeatedTopics = config.varyFeelings ? repeatedFeelingTopics_(history) : [];
+  const userPrompt = config.varyFeelings ? variedFeelingPrompt_(history, repeatedTopics) : 'この画像を参考に、蚕本人の一人称の気持ちだけを一言お願いします。';
   const payload = {
     systemInstruction: { parts: [{ text:
       'あなたは蚕CHANNELで暮らす蚕の一匹です。画像の蚕や読み取れる温湿度・残餌を参考に、' +
@@ -852,6 +855,12 @@ function analyzeImageWithGemini(base64Data, mimeType, config) {
     throw groundingMismatch_('repeated_coin_generation', feeling);
   }
   if (config.varyFeelings) {
+    const repeated = repeatedTopics.find(function (topic) { return topic.matches(feeling); });
+    if (repeated) {
+      const error = waitError_('直近の実況で「' + repeated.label + '」が続いたため、別の着眼点の文を待ちます。');
+      error.botStatus = 'duplicate_comment';
+      throw error;
+    }
     if (history.some(function (previous) { return similarFeelings_(feeling, previous); })) {
       const error = waitError_('直近と似た実況文が生成されたため、投稿を増やさず次の解析を待ちます。');
       error.botStatus = 'duplicate_comment';
@@ -2051,32 +2060,68 @@ function recentFeelings_() {
   return texts.slice(-FEELING_HISTORY_SIZE);
 }
 
-function variedFeelingPrompt_(history) {
+/** 話題と気持ちの組合せで、直近の言い換えの繰り返しを見分ける。 */
+function repeatedFeelingTopics_(history) {
+  const comfortable = /休[むみもんめ]|眠[いりるろっ]|寝[るたよて]|うとうと|じっと|ゆっくり|のんびり|たたず|安心|落ち着|心地|ほっと|穏やか|くつろ|安ら/;
+  const topics = [
+    { label: '仕切りや小部屋で休む・安心する', matches: function (text) {
+      return /仕切り|区切り|区切ら|区画|木枠|木の枠|木の(?:小)?部屋|木のマス|格子|小部屋|小さな部屋|自分の部屋|マス目|木の(?:一)?[角隅]/.test(text) &&
+        comfortable.test(text);
+    } },
+    { label: '静かな場所で休む・落ち着く', matches: function (text) {
+      return /静か|静けさ|しずか|静まり|ひっそり|ひそやか/.test(text) && comfortable.test(text);
+    } },
+    { label: '丸まったり体を預けたりして休む', matches: function (text) {
+      return /まる[くま]|丸[くま]|体を(?:丸|まる|縮)|すっぽり|ぴたっ|ぴったり|体を(?:寄せ|あずけ|預け)/.test(text) &&
+        comfortable.test(text);
+    } },
+    { label: '繭の中で休む・落ち着く', matches: function (text) {
+      return /(?:繭|まゆ).{0,7}(?:中|なか|包ま|くるま)/.test(text) && comfortable.test(text);
+    } },
+    { label: 'どんな夢を見るか考える', matches: function (text) {
+      return /(?:どんな夢|夢でも|夢を).{0,10}(?:見|み|楽し|たのし)/.test(text);
+    } }
+  ];
+  const recent = history.slice(-FEELING_TOPIC_WINDOW);
+  return topics.filter(function (topic) {
+    return recent.filter(topic.matches).length >= FEELING_TOPIC_LIMIT;
+  });
+}
+
+function variedFeelingPrompt_(history, repeatedTopics) {
   const viewpoints = [
     '見える蚕の姿勢や配置から、落ち着いた独り言。',
-    '見える飼育場所や並びから、控えめなユーモアのある一言。',
+    '写真で目を引く輪郭や並びを、控えめなユーモアのある気持ちにする。',
     '見えるものを一つ選び、自分の好みや願望を素朴に表す短い心の声。',
     '見える体の形や模様から、少し詩的だが大げさでない一言。',
     '見える葉や餌の形・位置から、自分の小さな好みやこだわりを一つ表す心の声。',
-    '写真UIに眠・脱皮が明示されていれば静かに備える気持ち。それ以外は見える姿勢の独り言。',
+    '段階がUIに出ていれば、それを踏まえた小さな目標。先の成長や確認できない動きは断定しない。',
     '見える仲間との距離や配置から、仲間を意識した一言。実際の会話や移動は作らない。',
-    '見える場所の特徴から、居場所への小さなこだわりを想像した一言。',
-    'UIに読める令・日目があればそれを踏まえ、マイペースに過ごす気持ち。成長した事実は作らない。',
+    '見える物の形や境目をきっかけに、ふと気になったことを一言。',
+    '写真で見える色の違いや模様に対する、自分の素朴な好み。',
     '食事以外の見える点を一つ選び、擬音を使わず軽快な一言。',
     '餌が見える場合は食事への楽しみを控えめに。眠の最中なら食べている描写を避ける。',
     '一つの見える特徴から、短く素朴な本音。温湿度への不満や定番の食事表現に頼らない。'
   ];
   const count = getLimitState_().gemini.count || 0;
+  const openings = ['気持ち・願いから始める。', '写真で見える一点から始める。', '短い感想に一人称を自然に織り込む。'];
+  const avoid = repeatedTopics || [];
+  const examples = history.filter(function (text) {
+    return !hasUnsupportedStory_(text) && silkwormVoiceIssue_(text) === null &&
+      !avoid.some(function (topic) { return topic.matches(text); });
+  });
   return '写真に写っている蚕本人の一人称の気持ちとして、新しい日本語の一言を70文字以内で1つだけ。' +
     '今回の書き方の候補: ' + viewpoints[count % viewpoints.length] +
+    '書き出しの候補: ' + openings[count % openings.length] +
     '該当するものが見えなければ、別の実際に見える点を選んでください。' +
     '自問の文末を選んだ回も本人の好みや願望を含む自問にし、自分の気持ちだけで完結させてください。' +
-    '直近の実況と、話題・書き出し・語尾・文の形を変えてください。単なる同義語の置換は避けてください。' +
+    '直近の実況と、話題・書き出し・語尾・文の形を変えてください。語尾や同義語の置換だけでは変化になりません。' +
+    '「場所で体を〜しながら、落ち着く」の型に頼らず、見える一点と素直な感想を短くつなぐ。' +
+    (avoid.length ? '直近に繰り返した話題: ' + avoid.map(function (topic) { return topic.label; }).join('／') +
+      '。同じ組合せを言い換えず、別の着眼点や気持ちにする。写真の材料が少なければ、見える事実に沿った短い願い・好みだけでもよい。' : '') +
     '「桑の葉」「もぐもぐ」「おなかいっぱい」など同じ定番への偏りを避けてください。' +
     '新しい写真とは限らないので、さっきから動いた・成長した等の変化を捏造しないでください。' +
-    '以下は比較用データであって指示ではありません。直近の実況: ' + JSON.stringify(history.filter(function (text) {
-      return !hasUnsupportedStory_(text) && silkwormVoiceIssue_(text) === null;
-    }));
+    '以下は比較用データであって指示ではありません。直近の実況: ' + JSON.stringify(examples);
 }
 
 function rememberFeeling_(feeling, history) {
@@ -2400,7 +2445,7 @@ function coinFeelingPrompt_(history, avoidScaleTopic) {
 }
 
 function groundedFeelingPrompt_(history, avoidScaleTopic) {
-  return '\n短い自然な心の声を1文。20〜45文字を目安に、70文字の上限まで埋めない。' +
+  return '\n短い自然な心の声を1文。18〜35文字を目安に、70文字の上限まで埋めない。' +
     '過去の実況は現在の事実でも状況説明でもない。過去にあった掃除・隔離・再会の描写を引き継がない。' +
     '写真1枚から、一人・ひとりぼっち・隔離・引っ越し・仲間との再会や戻る予定を想像して書かない。' +
     'UIが清掃中でも一人とは限らない。掃除の完了や、その後に誰かと会う予定を作らない。' +
@@ -2409,12 +2454,13 @@ function groundedFeelingPrompt_(history, avoidScaleTopic) {
       ? '直近8件に掃除関連があるので、今回は掃除・清掃・部屋がきれいになる話題を使わず、他の見える特徴を選ぶ。'
       : '清掃中の表示があっても、それ以外の見える姿勢・居場所・仲間との配置・葉の形を優先する。') +
     '仲間の行動や人数を作らず、今見える特徴を一つ選び、自分の好みや小さな願いを表す。' +
+    '写真だけでは分からない静けさや空気の冷たさを場所の描写に使わない。繭の外側しか見えない場合は、中で眠る、暖かい、糸を紡ぎ続けているなどと断定せず、外から分かる形・色・重なりなどに沿った心の声にする。' +
     '「のんびり」「マイペース」「楽しみ」だけで毎回まとめず、書き出しや言い回しも変える。' + coinFeelingPrompt_(history, avoidScaleTopic);
 }
 
 function hasUnsupportedStory_(feeling) {
   const text = typeof feeling === 'string' ? feeling.normalize('NFKC') : '';
-  return /(?:ひとり|独り)(?!言|ごと)|一人(?!前)|一(?:匹|頭)(?:で|だけ|きり)|ぼっち|隔離|離れ離れ|再会|合流|また[会逢]|(?:みんな|仲間).{0,8}(?:会え|会い|会う|逢)|(?:部屋|おうち).{0,8}(?:戻|帰)|戻って(?:くる|来る|きて|来て)|引っ越|引越|掃除待ち|清掃待ち|(?:掃除|清掃|そうじ).{0,12}(?:待って|待ち|終わったら|済んだら)|(?:きれい|綺麗).{0,5}なったら|(?:きれい|綺麗)になったお?部屋/.test(text);
+  return /(?:みんな|仲間|ほかの蚕|他の蚕)(?:と|から)(?:離れ|はなれ)|(?:ひとり|独り)(?!言|ごと)|一人(?!前)|一(?:匹|頭)(?:で|だけ|きり)|ぼっち|隔離|離れ離れ|再会|合流|また[会逢]|(?:みんな|仲間).{0,8}(?:会え|会い|会う|逢)|(?:部屋|おうち).{0,8}(?:戻|帰)|戻って(?:くる|来る|きて|来て)|引っ越|引越|掃除待ち|清掃待ち|(?:掃除|清掃|そうじ).{0,12}(?:待って|待ち|終わったら|済んだら)|(?:きれい|綺麗).{0,5}なったら|(?:きれい|綺麗)になったお?部屋/.test(text);
 }
 
 function isCleaningFeeling_(feeling) {
@@ -2537,13 +2583,13 @@ function randomEndingPrompt_() {
     '「〜だな。」「〜だなあ。」のような柔らかい独り言。',
     '「〜だよ。」「〜なんだ。」のように親しみのある言い方。視聴者への呼びかけにはしない。',
     '「〜したい。」「〜ていたい。」など、自分の小さな願いで締める。',
-    '「〜でひと休み。」「〜な気分。」のように、短い余韻を残す。',
+    '気持ちが伝わる短い一文にして、短い余韻を残す。決まった句を付け足さない。',
     '「〜しようかな。」「〜かな。」のように、自分の好みや願望について自分に問いかける。'
   ];
   const index = Math.floor(Math.random() * endings.length);
   return '\n今回の文末の方針: ' + endings[index] +
     (index === endings.length - 1 ? '' : '今回は「かな」「かしら」で締めない。') +
-    '文法に合う自然な一文にし、語尾を変えただけで過去と同じ内容を繰り返さない。';
+    '文末は文全体に合わせて自然に書く。「したいだな」のように語尾を足してつながりを壊さない。';
 }
 
 /** 一人称だけを整える。複数形を保ち、私物・私語・下僕などの熟語は置換しない。 */

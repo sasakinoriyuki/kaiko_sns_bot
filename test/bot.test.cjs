@@ -2095,7 +2095,7 @@ test('気持ちの視点は12通りあり本文の話題を食事や温湿度だ
   }
   assert.equal(new Set(prompts).size, 12);
   assert.ok(prompts.some(text => text.includes('仲間')));
-  assert.ok(prompts.some(text => text.includes('居場所')));
+  assert.ok(prompts.some(text => text.includes('色の違いや模様')));
   assert.ok(prompts.some(text => text.includes('食事以外')));
 });
 
@@ -5095,4 +5095,65 @@ test('抽選で一人称が変わっても同じ本文を再採用しない', ()
   assert.equal(h.calls.gemini.length, 2);
   assert.equal(h.calls.logs.length, 0);
   assert.deepEqual(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts, [text]);
+});
+
+test('文字が違っても仕切りで落ち着く話題が続いたら別の着眼点で再試行する', () => {
+  const history = ['ぼく、格子のすみでひと休みしたい。', 'わたし、木枠に囲まれていると気持ちが落ち着く。',
+    'ぼく、この葉の曲がり方が好き。', 'わたし、となりとの並びがちょっと気になる。'];
+  const repeating = 'ぼく、小さな部屋にすっぽり収まると、なんだか安心できるんだ。';
+  const alternate = '気になるな、ぼくのそばで重なる白いかたち。';
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: history }) },
+    geminiResponses: [careResponse(repeating), careResponse(alternate)] });
+  assert.ok(history.every(text => !h.context.similarFeelings_(text, repeating)));
+  const first = h.context.analyzeLatestImageAndLog({ triggerUid: 'school' });
+  assert.equal(first.status, 'duplicate_comment');
+  assert.equal(first.retryScheduled, true);
+  assert.ok(first.reason.includes('仕切りや小部屋で休む・安心する'));
+  assert.equal(h.calls.logs.length, 0);
+  assert.deepEqual(JSON.parse(h.values.YOSAN_FEELING_HISTORY_V1).texts, history);
+  const request = JSON.parse(h.calls.gemini[0].request.payload);
+  const prompt = request.contents[0].parts[0].text;
+  assert.ok(prompt.includes('直近に繰り返した話題: 仕切りや小部屋で休む・安心する'));
+  assert.ok(prompt.includes('書き出しの候補: 気持ち・願いから始める。'));
+  assert.ok(!prompt.includes(history[1]));
+  assert.ok(prompt.includes(history[2]));
+  h.advance(120000);
+  assert.equal(h.context.retrySchoolAnalysis({ triggerUid: 'retry' }).status, 'prepared');
+  assert.equal(h.state().feeling, alternate);
+  assert.equal(h.calls.gemini.length, 2);
+  assert.equal(h.calls.logs.length, 1);
+  assert.equal(h.calls.chats.length, 0);
+});
+
+test('仕切りが写っていても別の気持ちなら採用し古い繰り返しも期限を過ぎれば戻せる', () => {
+  const repeats = ['ぼく、木の区画では気持ちが落ち着く。', 'わたし、仕切りの中で休みたい。'];
+  const neutral = ['ぼく、この葉の形が好き。', 'ぼく、ぼんやり淡い色が気になる。', 'ぼく、もう少し伸びたい。'];
+  const next = 'ぼく、格子の向きがなんだか気になる。';
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: repeats }) },
+    geminiResponses: [careResponse(next)] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.state().feeling, next);
+  assert.equal(h.context.repeatedFeelingTopics_(repeats.concat(neutral)).length, 0);
+});
+
+test('夢の自問は語尾が変わっても続いた話題として検出する', () => {
+  const h = preparedSchool({ properties: { ...CARE_PROPERTIES, YOSAN_FEELING_HISTORY_V1: JSON.stringify({ texts: [
+    '葉の向こうでどんな夢を見ようかな、ぼく。', 'わたし、ここで楽しい夢を見たいな。'
+  ] }) }, geminiResponses: [careResponse('ぼく、丸まったままどんな夢をみよう。')] });
+  const result = h.context.analyzeLatestImageAndLog();
+  assert.equal(result.status, 'duplicate_comment');
+  assert.ok(result.reason.includes('どんな夢を見るか考える'));
+  assert.equal(h.calls.logs.length, 0);
+});
+
+test('離れていない仲間の気配は使えても仲間との隔離を作る文は投稿しない', () => {
+  const h = preparedSchool({ properties: CARE_PROPERTIES, geminiResponses: [
+    careResponse('ぼく、仲間から離れた部屋で休みたいな。'),
+    careResponse('ぼく、仲間のそばのこの並びが好きだな。')
+  ] });
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'grounding_mismatch');
+  assert.ok(h.calls.console.some(line => line.includes('[unsupported_story]')));
+  h.advance(60000);
+  assert.equal(h.context.analyzeLatestImageAndLog().status, 'prepared');
+  assert.equal(h.calls.logs.length, 1);
 });
